@@ -1,5 +1,9 @@
 # goweb-https
-Simple GO based web server using HTTPs
+Simple GO based web server using HTTPs that supports reading certificates from a given directory and uses SNI in order to serve simple request along with loaded certificates and their status. 
+
+Its purpose is to help you when securing/working with SSL certificates for your pods in your Kubernetes cluster environment.
+
+Please be mindful it is in `development` and subject to change.
 
 
 # k8s manifest
@@ -88,8 +92,8 @@ spec:
         securityContext:
           allowPrivilegeEscalation: false
           runAsNonRoot: true
-          runAsUser: 65534
-          runAsGroup: 65534
+          runAsUser: 65532
+          runAsGroup: 65532
           readOnlyRootFilesystem: true
           capabilities:
             drop:
@@ -104,7 +108,7 @@ spec:
           secretName: https-server-combined-cert
           defaultMode: 0400
       securityContext:
-        fsGroup: 65534
+        fsGroup: 65532
       restartPolicy: Always
       terminationGracePeriodSeconds: 30
 ```
