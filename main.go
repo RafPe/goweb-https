@@ -12,6 +12,9 @@ import (
 	"time"
 )
 
+// Global variable to track server start time
+var startTime = time.Now()
+
 type CertificateManager struct {
 	certMap     map[string]*tls.Certificate
 	certDetails map[string]*CertificateInfo
@@ -222,7 +225,52 @@ func (cm *CertificateManager) GetStatus() map[string]*CertificateInfo {
 func statusHandler(cm *CertificateManager) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprint(w, "Certificate Status:\n\n")
+
+		// Get hostname information
+		hostname, err := os.Hostname()
+		if err != nil {
+			hostname = "unknown"
+		}
+
+		fmt.Fprintf(w, "🖥️  Server Information:\n")
+		fmt.Fprintf(w, "   Hostname: %s\n", hostname)
+
+		// Add container/pod specific information if available
+		if podName := os.Getenv("POD_NAME"); podName != "" {
+			fmt.Fprintf(w, "   Pod Name: %s\n", podName)
+		}
+		if podNamespace := os.Getenv("POD_NAMESPACE"); podNamespace != "" {
+			fmt.Fprintf(w, "   Pod Namespace: %s\n", podNamespace)
+		}
+		if nodeName := os.Getenv("NODE_NAME"); nodeName != "" {
+			fmt.Fprintf(w, "   Node Name: %s\n", nodeName)
+		}
+		if containerName := os.Getenv("CONTAINER_NAME"); containerName != "" {
+			fmt.Fprintf(w, "   Container: %s\n", containerName)
+		}
+
+		// Docker container ID (if available)
+		if containerID := getContainerID(); containerID != "" {
+			fmt.Fprintf(w, "   Container ID: %s\n", containerID[:12]) // Show first 12 chars like docker ps
+		}
+
+		fmt.Fprintf(w, "   Server Time: %s\n", time.Now().Format(time.RFC3339))
+		fmt.Fprintf(w, "   Uptime: %s\n", time.Since(startTime).Truncate(time.Second))
+		fmt.Fprintf(w, "   Request From: %s\n", r.RemoteAddr)
+		fmt.Fprintf(w, "   User-Agent: %s\n", r.UserAgent())
+
+		// Add request headers that might indicate load balancer info
+		if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+			fmt.Fprintf(w, "   X-Forwarded-For: %s\n", forwarded)
+		}
+		if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+			fmt.Fprintf(w, "   X-Real-IP: %s\n", realIP)
+		}
+		if requestID := r.Header.Get("X-Request-ID"); requestID != "" {
+			fmt.Fprintf(w, "   X-Request-ID: %s\n", requestID)
+		}
+
+		fmt.Fprint(w, "\n📜 Certificate Status:\n\n")
 
 		for domain, info := range cm.GetStatus() {
 			fmt.Fprintf(w, "Domain: %s\n", domain)
@@ -233,36 +281,84 @@ func statusHandler(cm *CertificateManager) http.HandlerFunc {
 				info.X509Cert.NotAfter.Format(time.RFC3339))
 
 			if time.Now().After(info.X509Cert.NotAfter) {
-				fmt.Fprint(w, "  Status: EXPIRED\n")
+				fmt.Fprint(w, "  Status: ❌ EXPIRED\n")
+			} else if time.Until(info.X509Cert.NotAfter) < 30*24*time.Hour {
+				fmt.Fprintf(w, "  Status: ⚠️  EXPIRES SOON (in %s)\n", time.Until(info.X509Cert.NotAfter).Truncate(time.Hour))
 			} else {
-				fmt.Fprintf(w, "  Status: Valid (expires in %s)\n", time.Until(info.X509Cert.NotAfter).Truncate(time.Hour))
+				fmt.Fprintf(w, "  Status: ✅ Valid (expires in %s)\n", time.Until(info.X509Cert.NotAfter).Truncate(time.Hour))
 			}
 			fmt.Fprint(w, "\n")
 		}
 	}
 }
 
+// Helper function to get container ID from /proc/self/cgroup (Linux containers)
+func getContainerID() string {
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return ""
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "/docker/") {
+			parts := strings.Split(line, "/")
+			if len(parts) > 0 {
+				containerID := parts[len(parts)-1]
+				if len(containerID) >= 12 {
+					return containerID
+				}
+			}
+		}
+		// Handle other container runtimes
+		if strings.Contains(line, "/containerd/") {
+			parts := strings.Split(line, "/")
+			if len(parts) > 0 {
+				containerID := parts[len(parts)-1]
+				if len(containerID) >= 12 {
+					return containerID
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
 func helloHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 
+	// Get hostname information
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "unknown"
+	}
+
+	fmt.Fprintf(w, "I am ok in https\n")
+	fmt.Fprintf(w, "🖥️  Server: %s\n", hostname)
+	fmt.Fprintf(w, "⏰ Time: %s\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(w, "🌐 Client IP: %s\n", r.RemoteAddr)
+
 	connState := r.TLS
 	if connState != nil && len(connState.PeerCertificates) > 0 {
 		cert := connState.PeerCertificates[0]
-		fmt.Fprintf(w, "I am ok in https\n")
-		fmt.Fprintf(w, "SNI: %s\n", connState.ServerName)
-		fmt.Fprintf(w, "Certificate CN: %s\n", cert.Subject.CommonName)
-		fmt.Fprintf(w, "Certificate SANs: %v\n", cert.DNSNames)
-		fmt.Fprintf(w, "Certificate Valid: %s to %s\n",
+		fmt.Fprintf(w, "🔐 SNI: %s\n", connState.ServerName)
+		fmt.Fprintf(w, "📜 Certificate CN: %s\n", cert.Subject.CommonName)
+		fmt.Fprintf(w, "🏷️  Certificate SANs: %v\n", cert.DNSNames)
+		fmt.Fprintf(w, "⏳ Certificate Valid: %s to %s\n",
 			cert.NotBefore.Format(time.RFC3339),
 			cert.NotAfter.Format(time.RFC3339))
-	} else {
-		fmt.Fprint(w, "I am ok in https")
 	}
 }
 
 func main() {
 	certManager := NewCertificateManager()
+
+	// // Load from individual files
+	// if err := certManager.LoadCertificate("combined.pem", "combined.pem"); err != nil {
+	// 	log.Printf("Warning: %v", err)
+	// }
 
 	// load from a directory
 	if err := certManager.LoadCertificatesFromDirectory("./certs"); err != nil {
@@ -281,7 +377,6 @@ func main() {
 	tlsConfig := &tls.Config{
 		GetCertificate: certManager.GetCertificate,
 		MinVersion:     tls.VersionTLS13,
-		//MinVersion:     tls.VersionTLS12,
 	}
 
 	http.HandleFunc("/", helloHandler)
