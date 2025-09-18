@@ -456,9 +456,9 @@ func main() {
 		TLSConfig: tlsConfig,
 	}
 
-	fmt.Println("🚀 Production-ready HTTPS server starting on :8443")
+	fmt.Printf("🚀 Production-ready HTTPS server starting on :%s\n", port)
 	fmt.Printf("📜 Loaded certificates for domains: %v\n", domains)
-	fmt.Println("🔍 Certificate status available at: https://localhost:8443/status")
+	fmt.Printf("🔍 Certificate status available at: https://localhost:%s/status\n", port)
 
 	err := server.ListenAndServeTLS("", "")
 	if err != nil {
