@@ -15,6 +15,9 @@ import (
 // Global variable to track server start time
 var startTime = time.Now()
 
+// Get local timezone or configured timezone
+var localTZ = getLocalTimezone()
+
 type CertificateManager struct {
 	certMap     map[string]*tls.Certificate
 	certDetails map[string]*CertificateInfo
@@ -82,10 +85,12 @@ func (cm *CertificateManager) LoadCertificate(certFile, keyFile string) error {
 	// Check if certificate is expired or not yet valid
 	now := time.Now()
 	if now.Before(x509Cert.NotBefore) {
-		log.Printf("Warning: Certificate %s is not yet valid (valid from %s)", certFile, x509Cert.NotBefore)
+		validIn := x509Cert.NotBefore.Sub(now).Truncate(time.Second)
+		log.Printf("Warning: Certificate %s is not yet valid (valid in %s)", certFile, validIn)
 	}
 	if now.After(x509Cert.NotAfter) {
-		log.Printf("Warning: Certificate %s has expired (expired %s)", certFile, x509Cert.NotAfter)
+		expiredFor := now.Sub(x509Cert.NotAfter).Truncate(time.Second)
+		log.Printf("Warning: Certificate %s has EXPIRED %s ago", certFile, expiredFor)
 	}
 
 	domains := cm.extractDomains(x509Cert)
@@ -203,16 +208,27 @@ func (cm *CertificateManager) GetCertificate(clientHello *tls.ClientHelloInfo) (
 }
 
 func (cm *CertificateManager) logCertificateDetails(cert *x509.Certificate, domains []string, filePath string) {
+	now := time.Now()
 	log.Printf("Certificate loaded from: %s", filePath)
 	log.Printf("  Subject: %s", cert.Subject.String())
 	log.Printf("  Issuer: %s", cert.Issuer.String())
 	log.Printf("  Serial: %s", cert.SerialNumber.String())
-	log.Printf("  Valid: %s to %s", cert.NotBefore.Format(time.RFC3339), cert.NotAfter.Format(time.RFC3339))
+	log.Printf("  Valid: %s to %s",
+		formatTimeWithTimezone(cert.NotBefore),
+		formatTimeWithTimezone(cert.NotAfter))
 
-	if time.Now().After(cert.NotAfter) {
-		log.Printf("  ⚠️  EXPIRED")
-	} else if time.Until(cert.NotAfter) < 30*24*time.Hour {
-		log.Printf("  ⚠️  EXPIRES SOON (within 30 days)")
+	if now.After(cert.NotAfter) {
+		expiredFor := now.Sub(cert.NotAfter).Truncate(time.Second)
+		log.Printf("  ⚠️  EXPIRED %s ago", expiredFor)
+	} else if now.Before(cert.NotBefore) {
+		validIn := cert.NotBefore.Sub(now).Truncate(time.Second)
+		log.Printf("  ⚠️  NOT YET VALID (valid in %s)", validIn)
+	} else if cert.NotAfter.Sub(now) < 30*24*time.Hour {
+		timeUntilExpiry := cert.NotAfter.Sub(now).Truncate(time.Second)
+		log.Printf("  ⚠️  EXPIRES SOON (in %s)", timeUntilExpiry)
+	} else {
+		timeUntilExpiry := cert.NotAfter.Sub(now).Truncate(time.Second)
+		log.Printf("  ✅ Valid (expires in %s)", timeUntilExpiry)
 	}
 
 	log.Printf("  Domains: %v", domains)
@@ -254,7 +270,7 @@ func statusHandler(cm *CertificateManager) http.HandlerFunc {
 			fmt.Fprintf(w, "   Container ID: %s\n", containerID[:12]) // Show first 12 chars like docker ps
 		}
 
-		fmt.Fprintf(w, "   Server Time: %s\n", time.Now().Format(time.RFC3339))
+		fmt.Fprintf(w, "   Server Time: %s\n", formatTimeWithTimezone(time.Now()))
 		fmt.Fprintf(w, "   Uptime: %s\n", time.Since(startTime).Truncate(time.Second))
 		fmt.Fprintf(w, "   Request From: %s\n", r.RemoteAddr)
 		fmt.Fprintf(w, "   User-Agent: %s\n", r.UserAgent())
@@ -277,15 +293,23 @@ func statusHandler(cm *CertificateManager) http.HandlerFunc {
 			fmt.Fprintf(w, "  File: %s\n", info.FilePath)
 			fmt.Fprintf(w, "  CN: %s\n", info.X509Cert.Subject.CommonName)
 			fmt.Fprintf(w, "  Valid: %s to %s\n",
-				info.X509Cert.NotBefore.Format(time.RFC3339),
-				info.X509Cert.NotAfter.Format(time.RFC3339))
+				formatTimeWithTimezone(info.X509Cert.NotBefore),
+				formatTimeWithTimezone(info.X509Cert.NotAfter))
 
-			if time.Now().After(info.X509Cert.NotAfter) {
-				fmt.Fprint(w, "  Status: ❌ EXPIRED\n")
-			} else if time.Until(info.X509Cert.NotAfter) < 30*24*time.Hour {
-				fmt.Fprintf(w, "  Status: ⚠️  EXPIRES SOON (in %s)\n", time.Until(info.X509Cert.NotAfter).Truncate(time.Hour))
+			now := time.Now()
+			if now.After(info.X509Cert.NotAfter) {
+				expiredFor := now.Sub(info.X509Cert.NotAfter).Truncate(time.Second)
+				fmt.Fprintf(w, "  Status: ❌ EXPIRED (expired %s ago)\n", expiredFor)
+			} else if now.Before(info.X509Cert.NotBefore) {
+				validIn := info.X509Cert.NotBefore.Sub(now).Truncate(time.Second)
+				fmt.Fprintf(w, "  Status: ⏳ NOT YET VALID (valid in %s)\n", validIn)
 			} else {
-				fmt.Fprintf(w, "  Status: ✅ Valid (expires in %s)\n", time.Until(info.X509Cert.NotAfter).Truncate(time.Hour))
+				timeUntilExpiry := info.X509Cert.NotAfter.Sub(now).Truncate(time.Second)
+				if timeUntilExpiry < 30*24*time.Hour {
+					fmt.Fprintf(w, "  Status: ⚠️  EXPIRES SOON (in %s)\n", timeUntilExpiry)
+				} else {
+					fmt.Fprintf(w, "  Status: ✅ Valid (expires in %s)\n", timeUntilExpiry)
+				}
 			}
 			fmt.Fprint(w, "\n")
 		}
@@ -325,6 +349,39 @@ func getContainerID() string {
 	return ""
 }
 
+// Get timezone from environment or default to UTC+3
+func getLocalTimezone() *time.Location {
+	// Check environment variables for timezone
+	if tzEnv := os.Getenv("TZ"); tzEnv != "" {
+		if loc, err := time.LoadLocation(tzEnv); err == nil {
+			return loc
+		}
+	}
+
+	// Check for common timezone environment variables
+	if tzEnv := os.Getenv("TIMEZONE"); tzEnv != "" {
+		if loc, err := time.LoadLocation(tzEnv); err == nil {
+			return loc
+		}
+	}
+
+	// Default to UTC+3 (could be Europe/Athens, Europe/Istanbul, etc.)
+	// You can customize this to your specific timezone
+	utcPlus3 := time.FixedZone("UTC+3", 3*60*60)
+	return utcPlus3
+}
+
+// Format time in both UTC and local timezone
+func formatTimeWithTimezone(t time.Time) string {
+	utcTime := t.UTC().Format("2006-01-02 15:04:05 UTC")
+	localTime := t.In(localTZ).Format("2006-01-02 15:04:05 MST")
+
+	if utcTime == localTime {
+		return utcTime
+	}
+	return fmt.Sprintf("%s (%s)", localTime, utcTime)
+}
+
 func helloHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
@@ -337,7 +394,7 @@ func helloHandler(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintf(w, "I am ok in https\n")
 	fmt.Fprintf(w, "🖥️  Server: %s\n", hostname)
-	fmt.Fprintf(w, "⏰ Time: %s\n", time.Now().Format(time.RFC3339))
+	fmt.Fprintf(w, "⏰ Time: %s\n", formatTimeWithTimezone(time.Now()))
 	fmt.Fprintf(w, "🌐 Client IP: %s\n", r.RemoteAddr)
 
 	connState := r.TLS
@@ -347,21 +404,27 @@ func helloHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "📜 Certificate CN: %s\n", cert.Subject.CommonName)
 		fmt.Fprintf(w, "🏷️  Certificate SANs: %v\n", cert.DNSNames)
 		fmt.Fprintf(w, "⏳ Certificate Valid: %s to %s\n",
-			cert.NotBefore.Format(time.RFC3339),
-			cert.NotAfter.Format(time.RFC3339))
+			formatTimeWithTimezone(cert.NotBefore),
+			formatTimeWithTimezone(cert.NotAfter))
 	}
 }
 
 func main() {
 	certManager := NewCertificateManager()
 
+	// Load from directory (configurable via environment variable)
+	certificatesDir := os.Getenv("GOWEB_CERT_DIRECTORY_PATH")
+	if certificatesDir == "" {
+		certificatesDir = "./certs"
+	}
+
 	// // Load from individual files
 	// if err := certManager.LoadCertificate("combined.pem", "combined.pem"); err != nil {
 	// 	log.Printf("Warning: %v", err)
 	// }
 
-	// load from a directory
-	if err := certManager.LoadCertificatesFromDirectory("./certs"); err != nil {
+	// Optionally load from a directory
+	if err := certManager.LoadCertificatesFromDirectory(certificatesDir); err != nil {
 		log.Printf("Warning: Failed to load certificates from directory: %v", err)
 	}
 
@@ -382,8 +445,14 @@ func main() {
 	http.HandleFunc("/", helloHandler)
 	http.HandleFunc("/status", statusHandler(certManager))
 
+	// Get port from environment variable, default to 8443
+	port := os.Getenv("GOWEB_PORT")
+	if port == "" {
+		port = "8443"
+	}
+
 	server := &http.Server{
-		Addr:      ":8443",
+		Addr:      ":" + port,
 		TLSConfig: tlsConfig,
 	}
 
