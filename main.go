@@ -26,12 +26,6 @@ type CertReloader struct {
 	cachedCert        *tls.Certificate
 	cachedCertModTime time.Time
 }
-
-type CertificateManager struct {
-	certMap     map[string]*tls.Certificate
-	certDetails map[string]*CertificateInfo
-}
-
 type CertificateInfo struct {
 	Certificate *tls.Certificate
 	X509Cert    *x509.Certificate
@@ -49,11 +43,11 @@ func NewCertReloader(certFile, keyFile string) *CertReloader {
 }
 
 func (cr *CertReloader) Initialize() error {
-	modTime, err := cr.getFileModificationTime(cr.CertFile)
+	modTime, err := cr.getFileInfo(cr.CertFile)
 	if err != nil {
 		return err
 	}
-	cr.cachedCertModTime = modTime // Set the initial modification time on the file
+	cr.cachedCertModTime = modTime.ModTime() // Set the initial modification time on the file
 
 	tlsCertificate, err := cr.loadCertificate()
 	if err != nil {
@@ -75,12 +69,14 @@ func (cr *CertReloader) Initialize() error {
 // Implementation for tls.Config.GetCertificate - practical when running with PodCertificates mounted volumes
 // or secrets with TLS certificates which can be potentially updated.
 func (cr *CertReloader) GetCertificate(h *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	stat, err := os.Stat(cr.KeyFile)
+	stat, err := cr.getFileInfo(cr.CertFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed checking key file modification time: %w", err)
+		return nil, err
 	}
 
 	if cr.cachedCert == nil || stat.ModTime().After(cr.cachedCertModTime) {
+		log.Print("Refreshing certificate....")
+
 		pair, err := cr.loadCertificate()
 		if err != nil {
 			return nil, err
@@ -162,12 +158,12 @@ func (cr *CertReloader) extractURIs(cert *x509.Certificate) []string {
 	return uris
 }
 
-func (cr *CertReloader) getFileModificationTime(filePath string) (time.Time, error) {
+func (cr *CertReloader) getFileInfo(filePath string) (os.FileInfo, error) {
 	stat, err := os.Stat(filePath)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("failed checking key file modification time: %w", err)
+		return stat, fmt.Errorf("failed checking key file modification time: %w", err)
 	}
-	return stat.ModTime(), nil
+	return stat, nil
 }
 
 func getEnvOrDefault(envVar, defaultValue string) string {
