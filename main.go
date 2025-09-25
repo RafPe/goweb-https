@@ -298,6 +298,8 @@ func handlerStatus(cm *CertReloader) http.HandlerFunc {
 
 		info := cm.GetCertificateInfo()
 		fmt.Fprintf(w, "File: %s\n", info.FilePath)
+		fmt.Fprintf(w, "Issuer: %s\n", info.X509Cert.Issuer.String())
+		fmt.Fprintf(w, "Serial: %s\n", info.X509Cert.SerialNumber.String())
 		fmt.Fprintf(w, "CN: %s\n", info.X509Cert.Subject.CommonName)
 		fmt.Fprintf(w, "Domains:\n")
 		for _, domain := range info.Domains {
