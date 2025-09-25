@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,6 +20,7 @@ var startTime = time.Now()
 var localTZ = getLocalTimezone()
 
 type CertReloader struct {
+	certMu            sync.RWMutex
 	CertFile          string // path to the x509 certificate for https
 	KeyFile           string // path to the x509 private key matching `CertFile`
 	certDetails       *CertificateInfo
