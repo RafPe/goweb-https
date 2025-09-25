@@ -18,6 +18,14 @@ var startTime = time.Now()
 // Get local timezone or configured timezone
 var localTZ = getLocalTimezone()
 
+type CertReloader struct {
+	CertFile          string // path to the x509 certificate for https
+	KeyFile           string // path to the x509 private key matching `CertFile`
+	certDetails       *CertificateInfo
+	cachedCert        *tls.Certificate
+	cachedCertModTime time.Time
+}
+
 type CertificateManager struct {
 	certMap     map[string]*tls.Certificate
 	certDetails map[string]*CertificateInfo
@@ -27,8 +35,30 @@ type CertificateInfo struct {
 	Certificate *tls.Certificate
 	X509Cert    *x509.Certificate
 	Domains     []string
+	URIs        []string
 	FilePath    string
 	LoadedAt    time.Time
+}
+
+// Implementation for tls.Config.GetCertificate useful when using
+// Kubernetes Secrets which update the filesystem at runtime.
+func (cr *CertReloader) GetCertificate(h *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	stat, err := os.Stat(cr.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed checking key file modification time: %w", err)
+	}
+
+	if cr.cachedCert == nil || stat.ModTime().After(cr.cachedCertModTime) {
+		pair, err := tls.LoadX509KeyPair(cr.CertFile, cr.KeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed loading tls key pair: %w", err)
+		}
+
+		cr.cachedCert = &pair
+		cr.cachedCertModTime = stat.ModTime()
+	}
+
+	return cr.cachedCert, nil
 }
 
 func NewCertificateManager() *CertificateManager {
@@ -450,6 +480,10 @@ func main() {
 	if port == "" {
 		port = "8443"
 	}
+
+	// tlsConf := &tls.Config{
+	//     GetCertificate: certManager.GetCertificate,
+	// }
 
 	server := &http.Server{
 		Addr:      ":" + port,
