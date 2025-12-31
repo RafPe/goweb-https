@@ -101,7 +101,6 @@ func (cr *CertReloader) GetCertificateInfo() *CertificateInfo {
 }
 
 func (cr *CertReloader) loadCertificate() (*tls.Certificate, error) {
-	tls.LoadX509KeyPair(cr.CertFile, cr.KeyFile)
 	pair, err := tls.LoadX509KeyPair(cr.CertFile, cr.KeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed loading tls key pair: %w", err)
