@@ -75,7 +75,7 @@ func (cr *CertReloader) GetCertificate(h *tls.ClientHelloInfo) (*tls.Certificate
 	}
 
 	if cr.cachedCert == nil || stat.ModTime().After(cr.cachedCertModTime) {
-		log.Print("Refreshing certificate....")
+		log.Printf("(re)Loading certificate\n")
 
 		pair, err := cr.loadCertificate()
 		if err != nil {
@@ -236,6 +236,8 @@ func handlerRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 
+	log.Printf("Handling request /")
+
 	// Get hostname information
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -262,6 +264,8 @@ func handlerRoot(w http.ResponseWriter, r *http.Request) {
 func handlerStatus(cm *CertReloader) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+
+		log.Printf("Handling request /status")
 
 		// Get hostname information
 		hostname, err := os.Hostname()
@@ -330,7 +334,6 @@ func handlerStatus(cm *CertReloader) http.HandlerFunc {
 }
 
 func main() {
-	// certManager := NewCertificateManager()
 
 	certReloader := NewCertReloader(getEnvOrDefault("GOWEB_CERT_FILE", "./certs/demo.pem"), getEnvOrDefault("GOWEB_KEY_FILE", "./certs/demo-key.pem"))
 	if err := certReloader.Initialize(); err != nil {
@@ -353,9 +356,10 @@ func main() {
 		TLSConfig: tlsConfig,
 	}
 
-	fmt.Printf("🚀 Production-ready HTTPS server starting on :%s\n", port)
-	fmt.Printf("📜 Loaded certificate with domains: %v\n", certReloader.GetCertificateInfo().Domains)
-	fmt.Printf("🔍 Certificate status available at: https://localhost:%s/status\n", port)
+	log.Printf("Init completed ... \n")
+	log.Printf("  🚀 Production-ready HTTPS server starting on :%s\n", port)
+	log.Printf("  📜 Loaded certificate with domains: %v\n", certReloader.GetCertificateInfo().Domains)
+	log.Printf("  🔍 Certificate status available at: https://localhost:%s/status\n", port)
 
 	err := server.ListenAndServeTLS("", "")
 	if err != nil {
