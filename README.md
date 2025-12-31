@@ -140,7 +140,7 @@ spec:
     spec:
       containers:
       - name: server
-        image: ghcr.io/rafpe/goweb-https/server:d567d45        
+        image: ghcr.io/rafpe/goweb-https/server:latest        
         ports:
         - containerPort: 8443
           name: https
