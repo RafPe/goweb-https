@@ -1,15 +1,20 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 // Global variable to track server start time
@@ -409,6 +414,57 @@ func helloHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func watchDirectory(dir string, restartChan chan bool) error {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	defer watcher.Close()
+
+	err = watcher.Add(dir)
+	if err != nil {
+		return err
+	}
+
+	log.Printf("👀 Watching directory for changes: %s", dir)
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return nil
+			}
+			// Watch for Write, Create, and Remove events on certificate files
+			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Remove) != 0 {
+				log.Printf("📝 File change detected: %s (%s)", event.Name, event.Op)
+				restartChan <- true
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return nil
+			}
+			log.Printf("⚠️  Watcher error: %v", err)
+		}
+	}
+}
+
+func restartProcess() error {
+	pid := os.Getpid()
+	log.Printf("🔄 Sending SIGHUP to process (PID: %d)", pid)
+
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("failed to find process: %w", err)
+	}
+
+	if err := process.Signal(syscall.SIGHUP); err != nil {
+		return fmt.Errorf("failed to send SIGHUP: %w", err)
+	}
+
+	log.Println("✅ SIGHUP signal sent")
+	return nil
+}
+
 func main() {
 	certManager := NewCertificateManager()
 
@@ -418,12 +474,6 @@ func main() {
 		certificatesDir = "./certs"
 	}
 
-	// // Load from individual files
-	// if err := certManager.LoadCertificate("combined.pem", "combined.pem"); err != nil {
-	// 	log.Printf("Warning: %v", err)
-	// }
-
-	// Optionally load from a directory
 	if err := certManager.LoadCertificatesFromDirectory(certificatesDir); err != nil {
 		log.Printf("Warning: Failed to load certificates from directory: %v", err)
 	}
@@ -456,12 +506,74 @@ func main() {
 		TLSConfig: tlsConfig,
 	}
 
+	// Setup signal handling for graceful shutdown and reload
+	shutdownCtx, shutdownStop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer shutdownStop()
+
+	// Channel to signal restart/reload
+	restartChan := make(chan bool, 1)
+
+	// Channel for SIGHUP (reload)
+	sighupChan := make(chan os.Signal, 1)
+	signal.Notify(sighupChan, syscall.SIGHUP)
+
+	// Start file watcher in a goroutine
+	go func() {
+		if err := watchDirectory(certificatesDir, restartChan); err != nil {
+			log.Printf("⚠️  File watcher error: %v", err)
+		}
+	}()
+
 	fmt.Printf("🚀 Production-ready HTTPS server starting on :%s\n", port)
 	fmt.Printf("📜 Loaded certificates for domains: %v\n", domains)
 	fmt.Printf("🔍 Certificate status available at: https://localhost:%s/status\n", port)
 
-	err := server.ListenAndServeTLS("", "")
-	if err != nil {
-		log.Fatal("Server failed to start: ", err)
+	// Start server in a goroutine
+	go func() {
+		err := server.ListenAndServeTLS("", "")
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatal("Server failed to start: ", err)
+		}
+	}()
+
+	// Wait for signals
+	for {
+		select {
+		case <-shutdownCtx.Done():
+			log.Println("🛑 Shutdown signal received, stopping server gracefully...")
+			shutdownTimeout, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := server.Shutdown(shutdownTimeout); err != nil {
+				log.Printf("⚠️  Server shutdown error: %v", err)
+			}
+			log.Println("✅ Server stopped")
+			return
+		case <-sighupChan:
+			log.Println("🔄 SIGHUP received, reloading certificates...")
+			// Reload certificates
+			newCertManager := NewCertificateManager()
+			if err := newCertManager.LoadCertificatesFromDirectory(certificatesDir); err != nil {
+				log.Printf("⚠️  Failed to reload certificates: %v", err)
+				continue
+			}
+			newDomains := make([]string, 0, len(newCertManager.certMap))
+			for domain := range newCertManager.certMap {
+				newDomains = append(newDomains, domain)
+			}
+			if len(newDomains) == 0 {
+				log.Println("⚠️  No certificates loaded after reload, keeping current configuration")
+				continue
+			}
+			// Update certificate manager and TLS config
+			certManager = newCertManager
+			domains = newDomains
+			server.TLSConfig.GetCertificate = certManager.GetCertificate
+			log.Printf("✅ Certificates reloaded successfully for domains: %v", domains)
+		case <-restartChan:
+			log.Println("🔄 File change detected, triggering reload...")
+			if err := restartProcess(); err != nil {
+				log.Printf("⚠️  Failed to send SIGHUP: %v", err)
+			}
+		}
 	}
 }
