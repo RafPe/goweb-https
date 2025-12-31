@@ -101,6 +101,7 @@ func (cr *CertReloader) GetCertificateInfo() *CertificateInfo {
 }
 
 func (cr *CertReloader) loadCertificate() (*tls.Certificate, error) {
+	tls.LoadX509KeyPair(cr.CertFile, cr.KeyFile)
 	pair, err := tls.LoadX509KeyPair(cr.CertFile, cr.KeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("failed loading tls key pair: %w", err)
@@ -164,6 +165,25 @@ func (cr *CertReloader) getFileInfo(filePath string) (os.FileInfo, error) {
 		return stat, fmt.Errorf("failed checking key file modification time: %w", err)
 	}
 	return stat, nil
+}
+
+func getCertificateKeyPairPaths() ( string , string)  {
+	// This function is implemented to support scenario where we provide a PEM file instead of separate certificate and key files.
+	// GOWEB_X509_BUNDLE env variable is used to indicate that we are using a bundle file and takes precedence over GOWEB_X509_CER and GOWEB_X509_KEY ( if all provided )
+
+	// # GOWEB_X509_CER      - certificate file path
+	// # GOWEB_X509_KEY      - key file path
+	// # GOWEB_X509_BUNDLE   - bundle file path ( key and certificate in one file )
+
+	bundlePath, useBundle := os.LookupEnv("GOWEB_X509_BUNDLE")
+	if useBundle {
+		return bundlePath,bundlePath
+	}
+
+	certFile := getEnvOrDefault("GOWEB_X509_CER", "./certs/demo.pem")
+	keyFile := getEnvOrDefault("GOWEB_X509_KEY", "./certs/demo-key.pem")
+
+	return certFile, keyFile
 }
 
 func getEnvOrDefault(envVar, defaultValue string) string {
@@ -335,7 +355,12 @@ func handlerStatus(cm *CertReloader) http.HandlerFunc {
 
 func main() {
 
-	certReloader := NewCertReloader(getEnvOrDefault("GOWEB_CERT_FILE", "./certs/demo.pem"), getEnvOrDefault("GOWEB_KEY_FILE", "./certs/demo-key.pem"))
+	x509Cert := 
+
+	certReloader := NewCertReloader(
+		getEnvOrDefault("GOWEB_CERT_FILE", "./certs/demo.pem"), 
+		getEnvOrDefault("GOWEB_KEY_FILE", "./certs/demo-key.pem")
+	)
 	if err := certReloader.Initialize(); err != nil {
 		log.Fatal("ERROR: Failed to initialize certificate reloader: ", err)
 	}
@@ -366,3 +391,11 @@ func main() {
 		log.Fatal("Server failed to start: ", err)
 	}
 }
+
+
+// # GOWEB_PORT
+// # GOWEB_CERT_FILE
+// # GOWEB_KEY_FILE
+
+
+// # GOWEB_PORT
