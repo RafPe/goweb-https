@@ -6,6 +6,17 @@ Its purpose is to help you when securing/working with SSL certificates for your 
 Please be mindful it is in `development` and subject to change.
 
 
+# Configuration 
+This simple webserver allows for minimalistic configuration of the following fields 
+
+| Variable           | Priority | Purpose | 
+| --------           | -------  | ------- |
+| GOWEB_X509_BUNDLE  | 1        |  Defines the combined key and certificate file path to be used.        |
+| GOWEB_X509_KEY     | 2      |  Defines key file path        |
+| GOWEB_X509_CER     | 2     | Define certificate file path       |
+
+> In terms of priority `GOWEB_X509_BUNDLE` is considered first over cert and file paths
+
 # k8s manifest
 Sample manifests which can be used to explore the https based simple server. 
 
@@ -38,9 +49,9 @@ spec:
         env:
         - name: GOWEB_PORT
           value: "8443"
-        - name: GOWEB_KEY_FILE
+        - name: GOWEB_X509_KEY
           value: /app/combined.pem
-        - name: GOWEB_CERT_FILE
+        - name: GOWEB_X509_CER
           value: /app/combined.pem
         - name: TZ
           value: "Europe/Amsterdam"
@@ -137,10 +148,8 @@ spec:
         env:
         - name: GOWEB_PORT
           value: "8443"
-        - name: GOWEB_KEY_FILE
+        - name: GOWEB_X509_BUNDLE
           value: /var/run/pcr-x509/credentialbundle.pem
-        - name: GOWEB_CERT_FILE
-          value: /var/run/pcr-x509/credentialbundle.pem 
         - name: TZ
           value: "Europe/Nicosia"
         - name: POD_NAME
