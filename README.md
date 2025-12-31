@@ -38,10 +38,12 @@ spec:
         env:
         - name: GOWEB_PORT
           value: "8443"
-        - name: GOWEB_CERT_DIRECTORY_PATH
-          value: "/etc/ssl/certs"
+        - name: GOWEB_KEY_FILE
+          value: /app/combined.pem
+        - name: GOWEB_CERT_FILE
+          value: /app/combined.pem
         - name: TZ
-          value: "Europe/Nicosia"
+          value: "Europe/Amsterdam"
         - name: POD_NAME
           valueFrom:
             fieldRef:
@@ -50,16 +52,7 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-        - name: CONTAINER_NAME
-          value: "https-server"
         volumeMounts:
-        - name: certificates
-          mountPath: /etc/ssl/certs
-          readOnly: true
         - name: combined-cert
           mountPath: /app/combined.pem
           subPath: combined.pem
@@ -99,10 +92,6 @@ spec:
             drop:
             - ALL
       volumes:
-      - name: certificates
-        secret:
-          secretName: https-server-certs
-          defaultMode: 0400
       - name: combined-cert
         secret:
           secretName: https-server-combined-cert
@@ -148,8 +137,10 @@ spec:
         env:
         - name: GOWEB_PORT
           value: "8443"
-        - name: GOWEB_CERT_DIRECTORY_PATH
-          value: "/var/run/pcr-x509"
+        - name: GOWEB_KEY_FILE
+          value: /var/run/pcr-x509/credentialbundle.pem
+        - name: GOWEB_CERT_FILE
+          value: /var/run/pcr-x509/credentialbundle.pem 
         - name: TZ
           value: "Europe/Nicosia"
         - name: POD_NAME
@@ -160,12 +151,6 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.namespace
-        - name: NODE_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: spec.nodeName
-        - name: CONTAINER_NAME
-          value: "server"
         volumeMounts:
         - name: pcr-x509
           mountPath: /var/run/pcr-x509
