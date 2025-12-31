@@ -166,6 +166,29 @@ func (cr *CertReloader) getFileInfo(filePath string) (os.FileInfo, error) {
 	return stat, nil
 }
 
+func getCertificateKeyPairPaths() (string, string) {
+	// This function is implemented to support scenario where we provide a PEM file instead of separate certificate and key files.
+	// GOWEB_X509_BUNDLE env variable is used to indicate that we are using a bundle file and takes precedence over GOWEB_X509_CER and GOWEB_X509_KEY ( if all provided )
+
+	// # GOWEB_X509_CER      - certificate file path
+	// # GOWEB_X509_KEY      - key file path
+	// # GOWEB_X509_BUNDLE   - bundle file path ( key and certificate in one file )
+
+	bundlePath, useBundle := os.LookupEnv("GOWEB_X509_BUNDLE")
+	if useBundle {
+		log.Printf("Using bundle file: %s", bundlePath)
+		return bundlePath, bundlePath
+	}
+
+	certFile := getEnvOrDefault("GOWEB_X509_CER", "./certs/demo.pem")
+	keyFile := getEnvOrDefault("GOWEB_X509_KEY", "./certs/demo-key.pem")
+
+	log.Printf("Using certificate file: %s", certFile)
+	log.Printf("Using key file: %s", keyFile)
+
+	return certFile, keyFile
+}
+
 func getEnvOrDefault(envVar, defaultValue string) string {
 	envVar, exists := os.LookupEnv(envVar)
 	if !exists {
@@ -335,7 +358,12 @@ func handlerStatus(cm *CertReloader) http.HandlerFunc {
 
 func main() {
 
-	certReloader := NewCertReloader(getEnvOrDefault("GOWEB_CERT_FILE", "./certs/demo.pem"), getEnvOrDefault("GOWEB_KEY_FILE", "./certs/demo-key.pem"))
+	certFile, keyFile := getCertificateKeyPairPaths()
+
+	certReloader := NewCertReloader(
+		certFile,
+		keyFile,
+	)
 	if err := certReloader.Initialize(); err != nil {
 		log.Fatal("ERROR: Failed to initialize certificate reloader: ", err)
 	}
