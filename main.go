@@ -1,38 +1,48 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
 
-// Global variable to track server start time
-var startTime = time.Now()
+// Package-level state resolved once at startup.
+var (
+	startTime      = time.Now()
+	localTZ        = getLocalTimezone()
+	serverHostname = getHostname()
+)
 
-// Get local timezone or configured timezone
-var localTZ = getLocalTimezone()
+type CertificateInfo struct {
+	X509Cert *x509.Certificate
+	Domains  []string
+	FilePath string
+}
+
+// certSnapshot is an immutable view of the currently served certificate.
+// Reloads publish a new snapshot atomically, so readers never need a lock.
+type certSnapshot struct {
+	cert    *tls.Certificate
+	info    *CertificateInfo
+	modTime time.Time
+}
 
 type CertReloader struct {
-	certMu            sync.RWMutex
-	CertFile          string // path to the x509 certificate for https
-	KeyFile           string // path to the x509 private key matching `CertFile`
-	certInfo          *CertificateInfo
-	cachedCert        *tls.Certificate
-	cachedCertModTime time.Time
-}
-type CertificateInfo struct {
-	Certificate *tls.Certificate
-	X509Cert    *x509.Certificate
-	Domains     []string
-	URIs        []string
-	FilePath    string
-	LoadedAt    time.Time
+	CertFile string // path to the x509 certificate for https
+	KeyFile  string // path to the x509 private key matching `CertFile`
+
+	reloadMu sync.Mutex // serializes reloads; readers go through `current`
+	current  atomic.Pointer[certSnapshot]
 }
 
 func NewCertReloader(certFile, keyFile string) *CertReloader {
@@ -43,25 +53,37 @@ func NewCertReloader(certFile, keyFile string) *CertReloader {
 }
 
 func (cr *CertReloader) Initialize() error {
-	modTime, err := cr.getFileInfo(cr.CertFile)
-	if err != nil {
+	if err := cr.reload(); err != nil {
 		return err
 	}
-	cr.cachedCertModTime = modTime.ModTime() // Set the initial modification time on the file
-
-	tlsCertificate, err := cr.loadCertificate()
-	if err != nil {
-		return err
-	}
-	cr.cachedCert = tlsCertificate // Set the initially loaded certificate
-
-	certificateInfo, err := cr.parseCertificateInfo(tlsCertificate)
-	if err != nil {
-		return err
-	}
-	cr.certInfo = certificateInfo // Set the initially parsed certificate info
 
 	cr.printCertificateDetails()
+
+	return nil
+}
+
+// reload loads the key pair from disk and atomically replaces the current snapshot.
+func (cr *CertReloader) reload() error {
+	stat, err := os.Stat(cr.CertFile)
+	if err != nil {
+		return fmt.Errorf("failed to stat certificate file %s: %w", cr.CertFile, err)
+	}
+
+	pair, err := tls.LoadX509KeyPair(cr.CertFile, cr.KeyFile)
+	if err != nil {
+		return fmt.Errorf("failed loading tls key pair: %w", err)
+	}
+
+	info, err := parseCertificateInfo(&pair, cr.CertFile)
+	if err != nil {
+		return err
+	}
+
+	cr.current.Store(&certSnapshot{
+		cert:    &pair,
+		info:    info,
+		modTime: stat.ModTime(),
+	})
 
 	return nil
 }
@@ -69,47 +91,49 @@ func (cr *CertReloader) Initialize() error {
 // Implementation for tls.Config.GetCertificate - practical when running with PodCertificates mounted volumes
 // or secrets with TLS certificates which can be potentially updated.
 func (cr *CertReloader) GetCertificate(h *tls.ClientHelloInfo) (*tls.Certificate, error) {
-	stat, err := cr.getFileInfo(cr.CertFile)
+	snap := cr.current.Load()
+
+	stat, err := os.Stat(cr.CertFile)
 	if err != nil {
+		// The certificate file can be briefly unavailable while Kubernetes
+		// rotates a mounted secret; keep serving the cached certificate.
+		if snap != nil {
+			log.Printf("WARNING: cannot stat certificate file %s (%v), serving cached certificate", cr.CertFile, err)
+			return snap.cert, nil
+		}
 		return nil, err
 	}
 
-	if cr.cachedCert == nil || stat.ModTime().After(cr.cachedCertModTime) {
-		log.Printf("(re)Loading certificate\n")
+	if snap == nil || stat.ModTime().After(snap.modTime) {
+		cr.reloadMu.Lock()
+		defer cr.reloadMu.Unlock()
 
-		pair, err := cr.loadCertificate()
-		if err != nil {
-			return nil, err
+		// Re-check under the lock; a concurrent handshake may have reloaded already.
+		snap = cr.current.Load()
+		if snap == nil || stat.ModTime().After(snap.modTime) {
+			log.Printf("(re)Loading certificate from %s", cr.CertFile)
+			if err := cr.reload(); err != nil {
+				if snap != nil {
+					log.Printf("WARNING: certificate reload failed (%v), serving cached certificate", err)
+					return snap.cert, nil
+				}
+				return nil, err
+			}
+			snap = cr.current.Load()
 		}
-		cr.certMu.RLock()
-		defer cr.certMu.RUnlock()
-
-		cr.certInfo, err = cr.parseCertificateInfo(pair)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse certificate info: %w", err)
-		}
-
-		cr.cachedCert = pair
-		cr.cachedCertModTime = stat.ModTime()
 	}
 
-	return cr.cachedCert, nil
+	return snap.cert, nil
 }
 
 func (cr *CertReloader) GetCertificateInfo() *CertificateInfo {
-	return cr.certInfo
-}
-
-func (cr *CertReloader) loadCertificate() (*tls.Certificate, error) {
-	pair, err := tls.LoadX509KeyPair(cr.CertFile, cr.KeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed loading tls key pair: %w", err)
+	if snap := cr.current.Load(); snap != nil {
+		return snap.info
 	}
-	return &pair, nil
+	return nil
 }
 
-func (cr *CertReloader) parseCertificateInfo(cert *tls.Certificate) (*CertificateInfo, error) {
-
+func parseCertificateInfo(cert *tls.Certificate, filePath string) (*CertificateInfo, error) {
 	x509Cert, err := x509.ParseCertificate(cert.Certificate[0])
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse x509 certificate: %w", err)
@@ -119,26 +143,21 @@ func (cr *CertReloader) parseCertificateInfo(cert *tls.Certificate) (*Certificat
 	now := time.Now()
 	if now.Before(x509Cert.NotBefore) {
 		validIn := x509Cert.NotBefore.Sub(now).Truncate(time.Second)
-		log.Printf("WARNING: Certificate %s is not yet valid (valid in %s)", cr.CertFile, validIn)
+		log.Printf("WARNING: Certificate %s is not yet valid (valid in %s)", filePath, validIn)
 	}
 	if now.After(x509Cert.NotAfter) {
 		expiredFor := now.Sub(x509Cert.NotAfter).Truncate(time.Second)
-		return nil, fmt.Errorf("Certificate %s has EXPIRED %s ago", cr.CertFile, expiredFor)
+		return nil, fmt.Errorf("certificate %s expired %s ago", filePath, expiredFor)
 	}
 
-	certificateInfo := &CertificateInfo{
-		Certificate: cert,
-		X509Cert:    x509Cert,
-		Domains:     cr.extractSANs(x509Cert),
-		URIs:        cr.extractURIs(x509Cert),
-		FilePath:    cr.CertFile,
-		LoadedAt:    time.Now(),
-	}
-
-	return certificateInfo, nil
+	return &CertificateInfo{
+		X509Cert: x509Cert,
+		Domains:  extractSANs(x509Cert),
+		FilePath: filePath,
+	}, nil
 }
 
-func (cr *CertReloader) extractSANs(cert *x509.Certificate) []string {
+func extractSANs(cert *x509.Certificate) []string {
 	var domains []string
 
 	for _, san := range cert.DNSNames {
@@ -146,24 +165,6 @@ func (cr *CertReloader) extractSANs(cert *x509.Certificate) []string {
 	}
 
 	return domains
-}
-
-func (cr *CertReloader) extractURIs(cert *x509.Certificate) []string {
-	var uris []string
-
-	for _, uri := range cert.URIs {
-		uris = append(uris, strings.ToLower(uri.String()))
-	}
-
-	return uris
-}
-
-func (cr *CertReloader) getFileInfo(filePath string) (os.FileInfo, error) {
-	stat, err := os.Stat(filePath)
-	if err != nil {
-		return stat, fmt.Errorf("failed checking key file modification time: %w", err)
-	}
-	return stat, nil
 }
 
 func getCertificateKeyPairPaths() (string, string) {
@@ -189,60 +190,62 @@ func getCertificateKeyPairPaths() (string, string) {
 	return certFile, keyFile
 }
 
-func getEnvOrDefault(envVar, defaultValue string) string {
-	envVar, exists := os.LookupEnv(envVar)
-	if !exists {
-		envVar = defaultValue
+func getEnvOrDefault(name, defaultValue string) string {
+	if value, exists := os.LookupEnv(name); exists {
+		return value
 	}
-	return envVar
+	return defaultValue
 }
 
 func (cr *CertReloader) printCertificateDetails() {
 	now := time.Now()
-	log.Printf("Certificate loaded from: %s", cr.CertFile)
-	log.Printf("  Subject: %s", cr.certInfo.X509Cert.Subject.String())
-	log.Printf("  Issuer: %s", cr.certInfo.X509Cert.Issuer.String())
-	log.Printf("  Serial: %s", cr.certInfo.X509Cert.SerialNumber.String())
-	log.Printf("  Valid: %s to %s",
-		formatTimeWithTimezone(cr.certInfo.X509Cert.NotBefore),
-		formatTimeWithTimezone(cr.certInfo.X509Cert.NotAfter))
+	info := cr.GetCertificateInfo()
 
-	if now.After(cr.certInfo.X509Cert.NotAfter) {
-		expiredFor := now.Sub(cr.certInfo.X509Cert.NotAfter).Truncate(time.Second)
+	log.Printf("Certificate loaded from: %s", info.FilePath)
+	log.Printf("  Subject: %s", info.X509Cert.Subject.String())
+	log.Printf("  Issuer: %s", info.X509Cert.Issuer.String())
+	log.Printf("  Serial: %s", info.X509Cert.SerialNumber.String())
+	log.Printf("  Valid: %s to %s",
+		formatTimeWithTimezone(info.X509Cert.NotBefore),
+		formatTimeWithTimezone(info.X509Cert.NotAfter))
+
+	if now.After(info.X509Cert.NotAfter) {
+		expiredFor := now.Sub(info.X509Cert.NotAfter).Truncate(time.Second)
 		log.Printf("  ⚠️  EXPIRED %s ago", expiredFor)
-	} else if now.Before(cr.certInfo.X509Cert.NotBefore) {
-		validIn := cr.certInfo.X509Cert.NotBefore.Sub(now).Truncate(time.Second)
+	} else if now.Before(info.X509Cert.NotBefore) {
+		validIn := info.X509Cert.NotBefore.Sub(now).Truncate(time.Second)
 		log.Printf("  ⚠️  NOT YET VALID (valid in %s)", validIn)
-	} else if cr.certInfo.X509Cert.NotAfter.Sub(now) < 30*time.Minute {
-		timeUntilExpiry := cr.certInfo.X509Cert.NotAfter.Sub(now).Truncate(time.Second)
+	} else if info.X509Cert.NotAfter.Sub(now) < 30*time.Minute {
+		timeUntilExpiry := info.X509Cert.NotAfter.Sub(now).Truncate(time.Second)
 		log.Printf("  ⚠️  EXPIRES SOON (in %s)", timeUntilExpiry)
 	} else {
-		timeUntilExpiry := cr.certInfo.X509Cert.NotAfter.Sub(now).Truncate(time.Second)
+		timeUntilExpiry := info.X509Cert.NotAfter.Sub(now).Truncate(time.Second)
 		log.Printf("  ✅ Valid (expires in %s)", timeUntilExpiry)
 	}
 
-	log.Printf("  Domains: %v", cr.certInfo.Domains)
+	log.Printf("  Domains: %v", info.Domains)
 }
 
 func getLocalTimezone() *time.Location {
-	// Check environment variables for timezone
-	if tzEnv := os.Getenv("TZ"); tzEnv != "" {
-		if loc, err := time.LoadLocation(tzEnv); err == nil {
-			return loc
+	// Check common timezone environment variables
+	for _, envVar := range []string{"TZ", "TIMEZONE"} {
+		if tzEnv := os.Getenv(envVar); tzEnv != "" {
+			if loc, err := time.LoadLocation(tzEnv); err == nil {
+				return loc
+			}
+			log.Printf("WARNING: invalid timezone %q in %s, ignoring", tzEnv, envVar)
 		}
 	}
 
-	// Check for common timezone environment variables
-	if tzEnv := os.Getenv("TIMEZONE"); tzEnv != "" {
-		if loc, err := time.LoadLocation(tzEnv); err == nil {
-			return loc
-		}
-	}
+	return time.UTC
+}
 
-	// Default to UTC+3 (could be Europe/Athens, Europe/Istanbul, etc.)
-	// You can customize this to your specific timezone
-	utcPlus3 := time.FixedZone("UTC+3", 3*60*60)
-	return utcPlus3
+func getHostname() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "unknown"
+	}
+	return hostname
 }
 
 func formatTimeWithTimezone(t time.Time) string {
@@ -257,18 +260,11 @@ func formatTimeWithTimezone(t time.Time) string {
 
 func handlerRoot(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
 
-	log.Printf("Handling request /")
-
-	// Get hostname information
-	hostname, err := os.Hostname()
-	if err != nil {
-		hostname = "unknown"
-	}
+	log.Printf("Handling request %s", r.URL.Path)
 
 	fmt.Fprintf(w, "Hello there! I am serving this content via https :) \n")
-	fmt.Fprintf(w, "🖥️ Server: %s\n", hostname)
+	fmt.Fprintf(w, "🖥️ Server: %s\n", serverHostname)
 	fmt.Fprintf(w, "⏰ Time: %s\n", formatTimeWithTimezone(time.Now()))
 	fmt.Fprintf(w, "🌐 Client IP: %s\n", r.RemoteAddr)
 
@@ -290,14 +286,8 @@ func handlerStatus(cm *CertReloader) http.HandlerFunc {
 
 		log.Printf("Handling request /status")
 
-		// Get hostname information
-		hostname, err := os.Hostname()
-		if err != nil {
-			hostname = "unknown"
-		}
-
 		fmt.Fprintf(w, "🖥️  Server Information:\n")
-		fmt.Fprintf(w, "   Hostname: %s\n", hostname)
+		fmt.Fprintf(w, "   Hostname: %s\n", serverHostname)
 		if podName := os.Getenv("POD_NAME"); podName != "" {
 			fmt.Fprintf(w, "   Pod Name: %s\n", podName)
 		}
@@ -373,24 +363,45 @@ func main() {
 		MinVersion:     tls.VersionTLS13,
 	}
 
-	http.HandleFunc("/", handlerRoot)
-	http.HandleFunc("/status", handlerStatus(certReloader))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", handlerRoot)
+	mux.HandleFunc("GET /status", handlerStatus(certReloader))
 
 	// Get port from environment variable, default to 8443
 	port := getEnvOrDefault("GOWEB_PORT", "8443")
 
 	server := &http.Server{
-		Addr:      ":" + port,
-		TLSConfig: tlsConfig,
+		Addr:              ":" + port,
+		Handler:           mux,
+		TLSConfig:         tlsConfig,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("Init completed ... \n")
-	log.Printf("  🚀 Production-ready HTTPS server starting on :%s\n", port)
-	log.Printf("  📜 Loaded certificate with domains: %v\n", certReloader.GetCertificateInfo().Domains)
-	log.Printf("  🔍 Certificate status available at: https://localhost:%s/status\n", port)
+	log.Printf("Init completed ...")
+	log.Printf("  🚀 HTTPS server starting on :%s", port)
+	log.Printf("  📜 Loaded certificate with domains: %v", certReloader.GetCertificateInfo().Domains)
+	log.Printf("  🔍 Certificate status available at: https://localhost:%s/status", port)
 
-	err := server.ListenAndServeTLS("", "")
-	if err != nil {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- server.ListenAndServeTLS("", "")
+	}()
+
+	select {
+	case err := <-serveErr:
 		log.Fatal("Server failed to start: ", err)
+	case <-ctx.Done():
+		log.Printf("Shutdown signal received, draining connections ...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("WARNING: graceful shutdown failed: %v", err)
+		}
 	}
 }
