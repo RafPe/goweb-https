@@ -8,54 +8,142 @@ Please be mindful it is in `development` and subject to change.
 
 # Configuration
 
-This simple webserver allows for minimalistic configuration of the following fields.
+All configuration is read from the environment once at startup and validated
+before the server binds. An invalid value fails startup with a message naming
+the variable, rather than being silently ignored.
 
 ## Certificate material
 
 | Variable           | Priority | Purpose |
 | --------           | -------  | ------- |
-| GOWEB_X509_BUNDLE  | 1        | Defines the combined key and certificate file path to be used. |
-| GOWEB_X509_KEY     | 2        | Defines key file path. |
-| GOWEB_X509_CER     | 2        | Defines certificate file path. |
+| GOWEB_X509_BUNDLE  | 1        | Combined key and certificate file path. |
+| GOWEB_X509_KEY     | 2        | Key file path. |
+| GOWEB_X509_CER     | 2        | Certificate file path. |
 
-> In terms of priority `GOWEB_X509_BUNDLE` is considered first over cert and file paths.
+> `GOWEB_X509_BUNDLE` takes precedence over the separate certificate and key
+> paths. `GOWEB_X509_CER` and `GOWEB_X509_KEY` must be supplied together; setting
+> only one of them is rejected at startup.
 
-Defaults to `./certs/demo.pem` and `./certs/demo-key.pem`. These exist in a
-source checkout but are **not** included in the container image, so a deployment
-must always mount its own certificate material and set the variables above.
-
-## Server
+## Server and reload behaviour
 
 | Variable | Default | Purpose |
 | -------- | ------- | ------- |
 | GOWEB_PORT | `8443` | Listen port. |
-| TZ / TIMEZONE | `UTC` | Display timezone for timestamps. `TZ` is checked first, then `TIMEZONE`. An unknown zone is ignored with a warning. |
-| POD_NAME | – | Shown on `/status` when set. |
-| POD_NAMESPACE | – | Shown on `/status` when set. |
-
-> The default display timezone is now `UTC`. It was previously a fixed `UTC+3`
-> zone, so timestamps shift for anyone who did not set `TZ` or `TIMEZONE`.
+| TZ / TIMEZONE | `UTC` | Display timezone for timestamps. An unknown zone fails startup. |
+| GOWEB_SHUTDOWN_TIMEOUT | `10s` | How long in-flight requests may drain for on SIGTERM. |
+| GOWEB_RELOAD_DEBOUNCE | `500ms` | Quiet period after a filesystem event before re-reading. |
+| GOWEB_RELOAD_INTERVAL | `30s` | Periodic reconciliation against disk, independent of events. |
+| GOWEB_MAX_STALE_PERIOD | `15m` | How long the source may be unreadable before `/readyz` fails. |
+| GOWEB_ALLOW_EXPIRED_CERTIFICATE | `false` | Start with an already-expired certificate and report it instead of exiting. |
+| POD_NAME / POD_NAMESPACE | – | Shown on `/status`. |
 
 # Endpoints
 
 | Path | Purpose |
 | ---- | ------- |
 | `/` | Landing page showing host, time, and peer certificate details. |
-| `/status` | Certificate and process status. |
+| `/status` | Human-readable certificate and process diagnostics. |
+| `/status.json` | The same information as plain JSON, for machine consumers. |
+| `/livez` | Liveness. Reports only that the HTTP loop is running. |
+| `/readyz` | Readiness. Fails when no usable certificate exists, when the served certificate is outside its validity period, or when the source has been unreadable for longer than `GOWEB_MAX_STALE_PERIOD`. |
 
-Routes are method scoped. Unknown paths return **404** and unsupported methods
-return **405**. Previously every path was served by the `/` handler.
+Unknown paths return 404 and unsupported methods return 405.
 
-# Behaviour
+## Machine-readable status
 
-- The certificate is reloaded while the server runs when the certificate file
-  changes on disk, so a rotated secret is picked up without a restart.
-- If a reload fails, or the certificate file is briefly missing during a
-  rotation, the last valid certificate keeps being served.
-- Read, write, and idle timeouts are set on the HTTP server.
-- `SIGTERM` and `SIGINT` start a graceful shutdown with a **10 second** window to
-  drain in-flight connections. Set `terminationGracePeriodSeconds` above 10 in
-  your manifests so Kubernetes does not `SIGKILL` the pod mid-drain.
+`/status.json` returns the same data as `/status` with no emoji or prose. Both
+are rendered from one struct, so they cannot report different things.
+
+`/status` also honours content negotiation: send `Accept: application/json` and
+it returns the JSON document instead. A wildcard `Accept: */*` — which curl and
+most probes send — still gets the human page.
+
+```console
+$ curl -sk https://localhost:8443/status.json | jq '.certificate.validity, .readiness.ready'
+"valid"
+true
+```
+
+```json
+{
+  "server": {
+    "hostname": "goweb-0",
+    "pod_name": "goweb-0",
+    "pod_namespace": "demo",
+    "time": "2026-08-17T20:14:37Z",
+    "started_at": "2026-08-17T20:10:12Z",
+    "uptime_seconds": 265
+  },
+  "request": {
+    "remote_address": "10.244.0.1:58262",
+    "user_agent": "curl/8.7.1"
+  },
+  "certificate": {
+    "file_path": "/tls/tls.crt",
+    "subject": "CN=*.raf.tech",
+    "issuer": "CN=*.raf.tech",
+    "serial": "290383568814942334872090304415376416195",
+    "fingerprint_sha256": "26e170f3...ed9f224b",
+    "dns_names": ["*.raf.tech", "raf.tech"],
+    "uris": [],
+    "not_before": "2026-08-17T18:30:11Z",
+    "not_after": "2036-08-14T19:30:11Z",
+    "loaded_at": "2026-08-17T20:10:12Z",
+    "validity": "valid",
+    "expires_in_seconds": 315357333
+  },
+  "readiness": { "ready": true }
+}
+```
+
+Notes for consumers:
+
+- `validity` is one of `valid`, `not_yet_valid`, `expired`.
+- `expires_in_seconds` goes negative once the certificate has expired, so a
+  scrape can alert on a single number.
+- `certificate` is `null` when none is loaded. That is a different state from a
+  certificate with blank fields.
+- `dns_names` and `uris` are always arrays, never `null`.
+- `unverified_headers` echoes `X-Forwarded-For`, `X-Real-IP` and `X-Request-ID`
+  exactly as received. They are client supplied. Do not treat them as identity
+  unless a proxy in front of this server overwrites them.
+- Timestamps are RFC 3339 in the server's own zone.
+
+> **Probe endpoints changed.** Earlier versions had no dedicated probe paths, so
+> the manifests below used `/status` and `/`. Use `/livez` and `/readyz` instead
+> and update existing manifests accordingly. A certificate that fails to reload
+> is not fixed by restarting the process, which is why it degrades readiness
+> rather than liveness.
+
+# Certificate reloading
+
+The certificate is reloaded while the server runs, without dropping connections:
+
+- The parent directories of the certificate and key are watched, so Kubernetes
+  atomic/symlink rotations of projected volumes and mounted secrets are observed
+  even though the events never name the configured file.
+- Event bursts are debounced, and a partially written or mismatched key pair is
+  retried rather than published.
+- Changes are detected by comparing a SHA-256 fingerprint of the certificate,
+  not its modification time, so a rotation that preserves or backdates the
+  timestamp is still picked up.
+- A periodic reconciliation runs regardless of events, so a lost event cannot
+  strand an old certificate indefinitely.
+- If a reload fails, the last valid certificate keeps being served and the
+  failure is surfaced through `/readyz` and `/status`.
+
+# Development
+
+```bash
+make test    # go test -race -cover ./...
+make lint    # golangci-lint, installed into ./bin on first use
+make build   # binary into ./bin/server
+make run     # run from source
+make certs   # regenerate the self-signed demo certificates
+```
+
+The demo certificates in `certs/` are self-signed and committed so the server
+starts with no configuration. Regenerate them with `make certs`.
 
 # k8s manifest
 Sample manifests which can be used to explore the https based simple server. 
@@ -117,7 +205,7 @@ spec:
             cpu: "100m"
         livenessProbe:
           httpGet:
-            path: /status
+            path: /livez
             port: 8443
             scheme: HTTPS
           initialDelaySeconds: 30
@@ -126,7 +214,7 @@ spec:
           failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: /
+            path: /readyz
             port: 8443
             scheme: HTTPS
           initialDelaySeconds: 10
@@ -211,6 +299,28 @@ spec:
           limits:
             memory: "128Mi"
             cpu: "100m"
+        livenessProbe:
+          httpGet:
+            path: /livez
+            port: 8443
+            scheme: HTTPS
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+        # With a 1h certificate refreshed at 49m, a rotation the server fails to
+        # pick up must take the pod out of service before the old material
+        # expires. Readiness - not liveness - is the right signal: restarting
+        # does not fix a certificate that will not load.
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8443
+            scheme: HTTPS
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
         securityContext:
           allowPrivilegeEscalation: false
           runAsNonRoot: true
@@ -232,8 +342,7 @@ spec:
       securityContext:
         fsGroup: 65532
       restartPolicy: Always
-      # Must exceed the server's 10s connection drain window.
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 5
 ```
 
 
