@@ -6,16 +6,56 @@ Its purpose is to help you when securing/working with SSL certificates for your 
 Please be mindful it is in `development` and subject to change.
 
 
-# Configuration 
-This simple webserver allows for minimalistic configuration of the following fields 
+# Configuration
 
-| Variable           | Priority | Purpose | 
+This simple webserver allows for minimalistic configuration of the following fields.
+
+## Certificate material
+
+| Variable           | Priority | Purpose |
 | --------           | -------  | ------- |
-| GOWEB_X509_BUNDLE  | 1        |  Defines the combined key and certificate file path to be used.        |
-| GOWEB_X509_KEY     | 2      |  Defines key file path        |
-| GOWEB_X509_CER     | 2     | Define certificate file path       |
+| GOWEB_X509_BUNDLE  | 1        | Defines the combined key and certificate file path to be used. |
+| GOWEB_X509_KEY     | 2        | Defines key file path. |
+| GOWEB_X509_CER     | 2        | Defines certificate file path. |
 
-> In terms of priority `GOWEB_X509_BUNDLE` is considered first over cert and file paths
+> In terms of priority `GOWEB_X509_BUNDLE` is considered first over cert and file paths.
+
+Defaults to `./certs/demo.pem` and `./certs/demo-key.pem`. These exist in a
+source checkout but are **not** included in the container image, so a deployment
+must always mount its own certificate material and set the variables above.
+
+## Server
+
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| GOWEB_PORT | `8443` | Listen port. |
+| TZ / TIMEZONE | `UTC` | Display timezone for timestamps. `TZ` is checked first, then `TIMEZONE`. An unknown zone is ignored with a warning. |
+| POD_NAME | – | Shown on `/status` when set. |
+| POD_NAMESPACE | – | Shown on `/status` when set. |
+
+> The default display timezone is now `UTC`. It was previously a fixed `UTC+3`
+> zone, so timestamps shift for anyone who did not set `TZ` or `TIMEZONE`.
+
+# Endpoints
+
+| Path | Purpose |
+| ---- | ------- |
+| `/` | Landing page showing host, time, and peer certificate details. |
+| `/status` | Certificate and process status. |
+
+Routes are method scoped. Unknown paths return **404** and unsupported methods
+return **405**. Previously every path was served by the `/` handler.
+
+# Behaviour
+
+- The certificate is reloaded while the server runs when the certificate file
+  changes on disk, so a rotated secret is picked up without a restart.
+- If a reload fails, or the certificate file is briefly missing during a
+  rotation, the last valid certificate keeps being served.
+- Read, write, and idle timeouts are set on the HTTP server.
+- `SIGTERM` and `SIGINT` start a graceful shutdown with a **10 second** window to
+  drain in-flight connections. Set `terminationGracePeriodSeconds` above 10 in
+  your manifests so Kubernetes does not `SIGKILL` the pod mid-drain.
 
 # k8s manifest
 Sample manifests which can be used to explore the https based simple server. 
@@ -192,7 +232,8 @@ spec:
       securityContext:
         fsGroup: 65532
       restartPolicy: Always
-      terminationGracePeriodSeconds: 5
+      # Must exceed the server's 10s connection drain window.
+      terminationGracePeriodSeconds: 30
 ```
 
 
