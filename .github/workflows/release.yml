@@ -1,0 +1,179 @@
+name: Release
+
+# Merging a PR into main releases it. The release/* label on the PR decides the
+# version bump, so nothing has to be tagged, built or pushed by hand.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump to apply to the latest tag.
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  decide:
+    name: Resolve next version
+    # A merged PR labelled release/skip changes nothing that users can observe,
+    # so it produces no tag, no image and no release.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+       !contains(github.event.pull_request.labels.*.name, 'release/skip'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+      sha: ${{ steps.next.outputs.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - id: next
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BUMP: ${{ inputs.bump }}
+          LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: |
+          set -euo pipefail
+
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            bump="${INPUT_BUMP}"
+            sha="${GITHUB_SHA}"
+          else
+            bump=$(echo "${LABELS_JSON}" | jq -r '.[] | select(
+              . == "release/major" or . == "release/minor" or . == "release/patch"
+            )' | head -1)
+            bump="${bump#release/}"
+            sha="${MERGE_SHA}"
+          fi
+
+          case "${bump}" in
+            major|minor|patch) ;;
+            *) echo "::error::could not resolve a version bump from the PR labels"; exit 1 ;;
+          esac
+
+          # Highest existing release tag, so an out-of-order build cannot
+          # resurrect an old line.
+          latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+          [ -n "${latest}" ] || latest="v0.0.0"
+
+          version="${latest#v}"
+          major="${version%%.*}"
+          rest="${version#*.}"
+          minor="${rest%%.*}"
+          patch="${rest#*.}"
+
+          case "${bump}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+
+          tag="v${major}.${minor}.${patch}"
+
+          if git rev-parse "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::${tag} already exists"; exit 1
+          fi
+          git merge-base --is-ancestor "${sha}" origin/main ||
+            { echo "::error::release commit ${sha} is not on main"; exit 1; }
+
+          echo "Releasing ${latest} -> ${tag} (${bump}) at ${sha}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+
+  verify:
+    name: Verify
+    needs: decide
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.decide.outputs.sha }}
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # An image push is effectively irreversible, so the merge commit is
+      # re-checked here rather than trusting the PR run alone.
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  tag:
+    name: Create tag
+    needs: [decide, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.decide.outputs.sha }}
+          fetch-depth: 0
+
+      - env:
+          TAG: ${{ needs.decide.outputs.tag }}
+          SHA: ${{ needs.decide.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -a "${TAG}" -m "Release ${TAG}" "${SHA}"
+          git push origin "refs/tags/${TAG}"
+
+  publish-image:
+    name: Publish image
+    needs: [decide, tag]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/release-image.yml
+    with:
+      tag: ${{ needs.decide.outputs.tag }}
+      ref: ${{ needs.decide.outputs.sha }}
+
+  publish-release:
+    name: Publish release
+    needs: [decide, publish-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # The release is created last, so it never advertises a version whose
+      # image failed to build.
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.decide.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${TAG}" \
+            --generate-notes \
+            --verify-tag
+          {
+            echo "### Released ${TAG}"
+            echo
+            echo "\`ghcr.io/rafpe/goweb-https/server:${TAG}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"

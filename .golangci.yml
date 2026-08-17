@@ -1,0 +1,41 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck      # unchecked errors
+    - govet         # suspicious constructs
+    - staticcheck   # correctness, simplification and style checks
+    - ineffassign   # assignments never used
+    - unused        # unused code
+    - errorlint     # %v where %w belongs, err == x where errors.Is belongs
+    - bodyclose     # unclosed HTTP response bodies
+    - copyloopvar   # redundant loop variable copies
+    - gosec         # common security mistakes; this process handles TLS material
+    - revive        # exported doc comments and general style
+    - nilerr        # returning nil after a non-nil error
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - disableStutteringCheck
+
+  exclusions:
+    rules:
+      # Tests deliberately construct odd certificates and ignore writes.
+      - path: _test\.go
+        linters:
+          - gosec
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+
+issues:
+  # Report every occurrence: a truncated count reads as "mostly clean" when it
+  # is not.
+  max-issues-per-linter: 0
+  max-same-issues: 0
