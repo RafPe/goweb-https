@@ -132,6 +132,47 @@ The certificate is reloaded while the server runs, without dropping connections:
 - If a reload fails, the last valid certificate keeps being served and the
   failure is surfaced through `/readyz` and `/status`.
 
+# Releases
+
+Releases are cut by CI. Nothing is tagged, built or pushed by hand.
+
+Every PR into `main` must carry exactly one label, which decides the version
+bump. CI fails the PR if the label is missing or ambiguous.
+
+| Label | Effect on merge |
+| ----- | --------------- |
+| `release/major` | Bumps `X` — breaking change. |
+| `release/minor` | Bumps `Y` — new feature or improvement. |
+| `release/patch` | Bumps `Z` — fix or small change. |
+| `release/skip` | No tag, no image, no release. |
+
+On merge of a non-skip PR, CI resolves the next version from the newest
+existing tag, re-runs `go vet` and `go test -race` against the merge commit,
+creates the tag, builds and pushes the image, and only then publishes the
+GitHub release. The release is created last, so a version is never advertised
+whose image failed to build.
+
+## Published image
+
+```
+ghcr.io/rafpe/goweb-https/server:vX.Y.Z   # exact release
+ghcr.io/rafpe/goweb-https/server:vX.Y     # newest patch of that minor
+ghcr.io/rafpe/goweb-https/server:vX       # newest minor of that major
+ghcr.io/rafpe/goweb-https/server:latest   # newest release
+```
+
+Images are built for `linux/amd64` and `linux/arm64`, carry an SPDX SBOM
+attestation, and are signed keyless with cosign. Verify a release with:
+
+```bash
+cosign verify ghcr.io/rafpe/goweb-https/server:vX.Y.Z \
+  --certificate-identity-regexp '^https://github.com/RafPe/goweb-https/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+To release without merging a PR, run the **Release** workflow manually and pick
+the bump.
+
 # Development
 
 ```bash
@@ -141,6 +182,9 @@ make build   # binary into ./bin/server
 make run     # run from source
 make certs   # regenerate the self-signed demo certificates
 ```
+
+`make docker-build` and `make docker-push` still exist for local use, but
+merging to `main` publishes the image, so neither is needed for a release.
 
 The demo certificates in `certs/` are self-signed and committed so the server
 starts with no configuration. Regenerate them with `make certs`.

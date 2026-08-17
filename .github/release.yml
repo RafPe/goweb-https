@@ -1,0 +1,23 @@
+# Categories for the notes GitHub generates with `gh release create
+# --generate-notes`. The sections mirror the release/* labels that already
+# decide the version bump, so one label on a PR drives both.
+changelog:
+  exclude:
+    labels:
+      - release/skip
+  categories:
+    - title: 🚨 Breaking changes
+      labels:
+        - release/major
+    - title: 🚀 Features and improvements
+      labels:
+        - release/minor
+    - title: 🐛 Fixes
+      labels:
+        - release/patch
+    - title: 📦 Dependencies
+      labels:
+        - dependencies
+    - title: Other changes
+      labels:
+        - "*"
