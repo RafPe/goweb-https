@@ -217,12 +217,22 @@ external suite expects.
 
 ### Response contract
 
-`GET /whoami` with no verified client certificate returns `403` and a
-plain-text body. `GET /whoami.json` in the same case returns `403` and:
+`GET /whoami` with no verified client certificate returns `403` and
+exactly this plain-text body, newline included:
+
+```
+no client certificate presented
+```
+
+`GET /whoami.json` in the same case returns `403` and:
 
 ```json
 { "authenticated": false, "reason": "no client certificate presented" }
 ```
+
+Both strings are literal and are part of the contract. External suites
+will match on them, so they are asserted in the tests rather than left to
+whatever `fmt` produces.
 
 With a verified certificate, both return `200`. The JSON document is:
 
@@ -249,6 +259,12 @@ With a verified certificate, both return `200`. The JSON document is:
 `authenticated` is always present, so a consumer can branch on one field
 rather than on the absence of another.
 
+`expires_in_seconds` is not a field of `clientauth.Identity`. It is derived
+at render time from `deps.Now()`, exactly as `CertificateStatus` does for
+the served certificate (`internal/server/status.go:66`). Keeping it out of
+`Identity` keeps that type a description of the certificate rather than a
+value whose correctness depends on when it was built.
+
 Both representations render from a single struct, the way `StatusReport`
 already backs both forms of `/status` (`internal/server/status.go:16`).
 Rendering both from one value is what stops them drifting apart.
@@ -257,21 +273,33 @@ Rendering both from one value is what stops them drifting apart.
 scraper that cannot be pointed at a different URL still has a
 machine-readable option.
 
-### Related fix
+### Related change to `handleRoot`
 
 `handleRoot` (`internal/server/handlers.go:24`) already prints
 `state.PeerCertificates[0]` as "Certificate CN" and "Certificate SANs".
-Today no client certificate ever arrives, so the block is dead. Once this
-change lands it becomes live, and it is printing peer-supplied data under
-a label that reads like verified identity.
+Today no client certificate ever arrives, so the whole block is dead code.
+This change makes it live.
 
-The fix: read the verified identity through `clientauth.IdentityFrom` and
-label the block as the client certificate the server verified. If there is
-no verified identity, print nothing.
+This is **not** a security bug. Under `VerifyClientCertIfGiven` anything in
+`PeerCertificates` has been verified, so the label is accurate today. Two
+changes are wanted anyway:
 
-This follows the `UnverifiedHeaders` precedent (`internal/server/status.go:41`),
-where the field name carries the caveat because a machine consumer cannot
-read the documentation.
+1. Read the identity through `clientauth.IdentityFrom` rather than
+   `PeerCertificates` directly. Not because the current read is unsafe, but
+   so that there is one place in the codebase that decides what "the
+   verified client" means, and so the block stays correct if `ClientAuth`
+   is ever changed. Label it as the client certificate.
+
+2. `🔐 SNI` currently sits *inside* the `len(PeerCertificates) > 0` guard,
+   so it prints only when a client certificate arrives — which is
+   backwards, and today means never. Move it out and print it whenever
+   `r.TLS != nil`.
+
+Point 2 is a deliberate change to the landing page: it gains an SNI line on
+every TLS request. That is wanted for a TLS fixture. It is called out here
+because it is the one place this work alters existing output, and the
+"done" criteria below carve it out explicitly rather than leaving an
+implementer to guess.
 
 ## Testing
 
@@ -310,9 +338,15 @@ surface as an error on the client's first `Read` rather than from
 
 ## `hack/gencerts`
 
-Today it emits a self-signed server leaf with `IsCA: false`
-(`hack/gencerts/main.go:63`). It gains a flag — `-client-ca` — that
-additionally emits:
+Today `run` builds one `x509.Certificate` template and signs it with
+itself (`hack/gencerts/main.go:53-69`). Emitting a CA and a leaf signed by
+that CA needs two templates and two keys, with the leaf signed by the CA's
+key rather than its own. That is a restructure of `run` into a small
+"build key, build template, sign with parent" helper called three times —
+not a flag bolted onto the existing single-template path. It is the
+largest piece of new code in this plan; budget for it accordingly.
+
+The new `-client-ca` flag additionally emits:
 
 - `client-ca.pem` / `client-ca-key.pem`: a CA with `IsCA: true`,
   `KeyUsage: CertSign | CRLSign`.
@@ -352,7 +386,7 @@ README gains:
 | `internal/config/config_test.go` | Cases for the new variable. |
 | `internal/server/server.go` | `Dependencies.ClientCAs`, `tls.Config`, routes. |
 | `internal/server/whoami.go` | New. Handlers and the response struct. |
-| `internal/server/handlers.go` | Fix the client-certificate block in `handleRoot`. |
+| `internal/server/handlers.go` | `handleRoot`: identity via `clientauth`, SNI moved out of the cert guard. |
 | `internal/server/whoami_test.go` | New. Handshake-level tests. |
 | `internal/server/server_test.go` | Probes and existing routes under `ClientCAs`. |
 | `cmd/goweb-https/main.go` | Load the pool, pass it, log it. |
@@ -364,8 +398,11 @@ README gains:
 
 - `make test` passes with `-race`.
 - `make lint` passes.
-- `go test -cover ./internal/clientauth/...` and `./internal/server/...`
-  hold at or above the current 90.6% for `internal/server`.
-- With `GOWEB_MTLS_CLIENT_CA` unset, every existing endpoint behaves
-  byte-identically to `main`.
+- Every test listed under "Testing" exists and passes. Every new exported
+  function and every new route has at least one test. No percentage
+  target: the list above is the gate, because a coverage number moves
+  when the denominator does and invites filler tests to chase it.
+- With `GOWEB_MTLS_CLIENT_CA` unset, `/status`, `/status.json`, `/livez`
+  and `/readyz` behave byte-identically to `main`. `/` differs only by
+  the added SNI line described under "Related change to `handleRoot`".
 - The README contract table matches what the code actually does.
