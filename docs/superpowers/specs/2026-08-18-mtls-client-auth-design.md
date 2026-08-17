@@ -1,0 +1,371 @@
+# Client-certificate authentication endpoint
+
+Date: 2026-08-18
+Status: proposed, awaiting review
+Branch: `worktree-mtls-client-auth`
+
+## Purpose
+
+`goweb-https` is used as a fixture by e2e suites that live in other
+repositories. Those suites need a target that proves an mTLS handshake
+happened and reports which client identity the server verified.
+
+This design adds that: optional client-certificate verification on the
+existing listener, and one endpoint that reports the verified client
+identity.
+
+Nothing e2e-shaped ships here. No `make e2e` target, no CI e2e job, no
+container harness. The deliverable is the behaviour, its Go tests, the
+means to mint client certificates the server trusts, and documentation
+precise enough for an external suite to assert against.
+
+## Scope
+
+In scope:
+
+- Optional client-certificate verification, off by default.
+- `GET /whoami` and `GET /whoami.json` reporting the verified client identity.
+- A new `internal/clientauth` package owning trust-store loading and
+  identity extraction.
+- `hack/gencerts` gains a mode that emits a client CA and a client leaf.
+- README documentation of the endpoint contract and the environment variable.
+
+Out of scope:
+
+- Client CA reloading. See "Decisions" below.
+- Any change to `/`, `/status`, `/status.json`, `/livez`, `/readyz` behaviour
+  beyond one labelling fix described under "Related fix".
+- Authorisation. The endpoint reports identity; it does not decide what an
+  identity may do.
+
+## Decisions
+
+### Verification is listener-wide, enforcement is per-route
+
+`server.New` builds one `tls.Config` for one listener serving every route
+(`internal/server/server.go:88`). Setting `tls.RequireAndVerifyClientCert`
+on it would stop `/livez` and `/readyz` from working, because Kubernetes
+probes present no client certificate. The pod would never become ready and
+the manifests in the README would break.
+
+So the listener is configured with `tls.VerifyClientCertIfGiven`, which
+makes a client certificate optional, and `/whoami` alone requires one.
+
+Rejected: a second mTLS-only listener on its own port. It doubles the
+`Run` and shutdown plumbing and the configuration surface, and buys
+nothing this fixture needs.
+
+### Presence of the CA path enables the feature
+
+`GOWEB_MTLS_CLIENT_CA` names a PEM file of trusted client CA certificates.
+When it is unset, `ClientAuth` stays at `tls.NoClientCert` and the server
+behaves exactly as it does today. When it is set, the file must exist and
+must contain at least one certificate, or startup fails.
+
+This follows `certificatePaths` (`internal/config/config.go:150`), where a
+half-configured certificate is treated as an operator mistake rather than a
+request to fall back to a default. There is no separate boolean flag: a
+second variable that can disagree with the first is a way to be
+misconfigured, not a feature.
+
+### Correct mTLS semantics, not a friendlier error
+
+Under `tls.VerifyClientCertIfGiven` a client certificate that fails to
+verify aborts the handshake. It never reaches HTTP. There are therefore
+three observable outcomes:
+
+| Client behaviour | Result |
+| --- | --- |
+| No client certificate | TLS succeeds; `GET /whoami` returns `403` |
+| Certificate not signed by a configured CA | TLS handshake fails; no HTTP response |
+| Certificate signed by a configured CA | TLS succeeds; `GET /whoami` returns `200` |
+
+Rejected: `tls.RequestClientCert` plus a hand-written `VerifyPeerCertificate`,
+which would turn the middle row into a `403` carrying a reason. That is
+friendlier for an external suite to assert on, but hand-rolled certificate
+chain verification is where authentication bugs live, and the failure mode
+is accepting an untrusted identity. The middle row stays a handshake
+failure. External suites assert on the connection error.
+
+This table is part of the contract and must appear in the README.
+
+### The client CA loads once, at startup
+
+The served certificate reloads because it rotates. A client trust store
+changes on a different timescale and a restart is an acceptable way to pick
+up a new one.
+
+Reloading it would mean `GetConfigForClient`, whose returned config
+*replaces* the base config rather than merging with it. Every future
+change to `TLSConfig` would then have to be mirrored into that path, and
+forgetting to mirror `GetCertificate` or `MinVersion` breaks server
+authentication or the TLS floor silently. Not worth it for this.
+
+If reloading is wanted later it is a separate, deliberate change.
+
+### Test material is generated, not committed
+
+Tests mint their own CA, server leaf, and client leaf with `crypto/x509`.
+No new files under `certs/`.
+
+The committed demo material already has the problem that it expires on a
+schedule nobody watches — `hack/gencerts` exists because of it, and says
+so in its own doc comment. Adding a committed client CA and client
+certificate would add two more.
+
+External suites need material the server trusts, so `hack/gencerts` gains
+a mode that emits one. That is a tool invocation, not a committed artefact.
+
+## Architecture
+
+### New package: `internal/clientauth`
+
+Owns everything about the client trust store and about turning a TLS
+connection state into an identity. It is the unit that can be tested
+without an HTTP server and without a listener.
+
+```go
+// LoadPool reads a PEM file of trusted client CA certificates.
+// It fails when the file cannot be read or contains no certificate,
+// because a trust store that trusts nothing is a configuration error.
+func LoadPool(path string) (*x509.CertPool, error)
+
+// Identity describes a verified client certificate.
+type Identity struct {
+    Subject           string
+    Issuer            string
+    Serial            string
+    FingerprintSHA256 string
+    DNSNames          []string
+    URIs              []string
+    EmailAddresses    []string
+    IPAddresses       []string
+    NotBefore         time.Time
+    NotAfter          time.Time
+
+    // Chain lists the verified chain from leaf to root, by subject.
+    Chain []string
+}
+
+// IdentityFrom extracts the verified client identity from a connection.
+// The boolean reports whether the peer presented a certificate that the
+// server verified. It reads VerifiedChains, never PeerCertificates.
+func IdentityFrom(state *tls.ConnectionState) (Identity, bool)
+```
+
+`IdentityFrom` must gate on `len(state.VerifiedChains) > 0` and read the
+leaf from `state.VerifiedChains[0][0]`. It must not read
+`state.PeerCertificates`. Under the current `VerifyClientCertIfGiven`
+setting the two agree, but they stop agreeing the moment anyone changes
+`ClientAuth`, and the failure is silent acceptance of an unverified
+identity. The distinction is enforced by the code and stated in the
+doc comment.
+
+This mirrors how `certreload.Info` is produced by one package and consumed
+by `internal/server` through a narrow type.
+
+### `internal/config`
+
+`Config` gains one field:
+
+```go
+// ClientCAFile is the PEM file of client CA certificates to verify client
+// certificates against. Empty means client-certificate verification is
+// disabled.
+ClientCAFile string
+```
+
+Read from `GOWEB_MTLS_CLIENT_CA`. Set-but-empty is an error, matching the
+existing style. The file is not opened here — `config` reads the
+environment and nothing else, and that property is worth keeping.
+
+### `internal/server`
+
+`Dependencies` gains:
+
+```go
+// ClientCAs is the trust store for client certificates. When nil, client
+// certificates are not requested and /whoami always refuses.
+ClientCAs *x509.CertPool
+```
+
+`New` sets, only when `deps.ClientCAs != nil`:
+
+```go
+ClientAuth: tls.VerifyClientCertIfGiven,
+ClientCAs:  deps.ClientCAs,
+```
+
+`GetCertificate` and `MinVersion: tls.VersionTLS13` are unchanged.
+
+`routes` gains:
+
+```go
+mux.HandleFunc("GET /whoami", handleWhoami(deps))
+mux.HandleFunc("GET /whoami.json", handleWhoamiJSON(deps))
+```
+
+### `cmd/goweb-https`
+
+`run` loads the pool when `cfg.ClientCAFile != ""`, fails startup on error,
+passes it into `server.Dependencies`, and logs that client-certificate
+verification is enabled along with the subjects it will trust. Startup
+logging is how an operator confirms the fixture is configured the way the
+external suite expects.
+
+## The endpoint
+
+### Response contract
+
+`GET /whoami` with no verified client certificate returns `403` and a
+plain-text body. `GET /whoami.json` in the same case returns `403` and:
+
+```json
+{ "authenticated": false, "reason": "no client certificate presented" }
+```
+
+With a verified certificate, both return `200`. The JSON document is:
+
+```json
+{
+  "authenticated": true,
+  "client": {
+    "subject": "CN=e2e-client,O=goweb",
+    "issuer": "CN=goweb-test-ca",
+    "serial": "...",
+    "fingerprint_sha256": "...",
+    "dns_names": [],
+    "uris": [],
+    "email_addresses": [],
+    "ip_addresses": [],
+    "not_before": "2026-08-18T00:00:00Z",
+    "not_after": "2027-08-18T00:00:00Z",
+    "expires_in_seconds": 31536000,
+    "chain": ["CN=e2e-client,O=goweb", "CN=goweb-test-ca"]
+  }
+}
+```
+
+`authenticated` is always present, so a consumer can branch on one field
+rather than on the absence of another.
+
+Both representations render from a single struct, the way `StatusReport`
+already backs both forms of `/status` (`internal/server/status.go:16`).
+Rendering both from one value is what stops them drifting apart.
+
+`GET /whoami` honours `prefersJSON` for the same reason `/status` does: a
+scraper that cannot be pointed at a different URL still has a
+machine-readable option.
+
+### Related fix
+
+`handleRoot` (`internal/server/handlers.go:24`) already prints
+`state.PeerCertificates[0]` as "Certificate CN" and "Certificate SANs".
+Today no client certificate ever arrives, so the block is dead. Once this
+change lands it becomes live, and it is printing peer-supplied data under
+a label that reads like verified identity.
+
+The fix: read the verified identity through `clientauth.IdentityFrom` and
+label the block as the client certificate the server verified. If there is
+no verified identity, print nothing.
+
+This follows the `UnverifiedHeaders` precedent (`internal/server/status.go:41`),
+where the field name carries the caveat because a machine consumer cannot
+read the documentation.
+
+## Testing
+
+All Go tests. `make test` already runs with `-race`.
+
+`internal/clientauth`:
+
+- `LoadPool` on a valid CA file, a missing file, a file of non-PEM bytes,
+  and a PEM file containing no certificate.
+- `IdentityFrom` with a nil state, a state with no peer certificate, and a
+  state with a verified chain.
+- A test asserting `IdentityFrom` returns false when `PeerCertificates` is
+  populated but `VerifiedChains` is empty. This is the regression test for
+  the distinction the package exists to enforce.
+
+`internal/server`, over a real listener with a real handshake — extend the
+existing pattern at `internal/server/server_test.go:289`:
+
+- Client with a certificate signed by the trusted CA: `200`, and the body
+  reports that client's subject.
+- Client with no certificate: `403`, `authenticated` false.
+- Client with a certificate signed by an untrusted CA: the request fails.
+  Assert that no successful HTTP response is returned rather than matching
+  an exact error string.
+- `ClientCAs` nil: `/whoami` returns `403` and the handshake requests no
+  certificate.
+- The existing routes and probes still behave identically with `ClientCAs`
+  set. This is the test that would have caught `RequireAndVerifyClientCert`.
+
+`internal/config`: `GOWEB_MTLS_CLIENT_CA` unset, set, and set-empty.
+
+Note for the implementer: under TLS 1.3 the client certificate is verified
+after the server's Finished message, so a rejected client certificate may
+surface as an error on the client's first `Read` rather than from
+`Handshake`. Write the untrusted-certificate test to tolerate either.
+
+## `hack/gencerts`
+
+Today it emits a self-signed server leaf with `IsCA: false`
+(`hack/gencerts/main.go:63`). It gains a flag — `-client-ca` — that
+additionally emits:
+
+- `client-ca.pem` / `client-ca-key.pem`: a CA with `IsCA: true`,
+  `KeyUsage: CertSign | CRLSign`.
+- `client.pem` / `client-key.pem`: a leaf signed by that CA, with
+  `ExtKeyUsage: ClientAuth` only.
+
+The existing default behaviour is unchanged when the flag is absent.
+
+A `make certs-client` target wraps it, and the README shows the curl
+invocation an external suite would mirror:
+
+```
+curl --cacert certs/demo.pem \
+     --cert certs/client.pem --key certs/client-key.pem \
+     https://localhost:8443/whoami.json
+```
+
+## Documentation
+
+README gains:
+
+- `GOWEB_MTLS_CLIENT_CA` in the configuration table, noting that its
+  presence enables client-certificate verification.
+- `/whoami` and `/whoami.json` in the endpoints table.
+- The three-outcome table from "Decisions" above, verbatim. An external
+  suite author needs to know that an untrusted certificate is a connection
+  failure and not a `403`.
+- The `make certs-client` and curl example.
+
+## Files touched
+
+| File | Change |
+| --- | --- |
+| `internal/clientauth/clientauth.go` | New. `LoadPool`, `Identity`, `IdentityFrom`. |
+| `internal/clientauth/clientauth_test.go` | New. |
+| `internal/config/config.go` | `ClientCAFile` field, `GOWEB_MTLS_CLIENT_CA`. |
+| `internal/config/config_test.go` | Cases for the new variable. |
+| `internal/server/server.go` | `Dependencies.ClientCAs`, `tls.Config`, routes. |
+| `internal/server/whoami.go` | New. Handlers and the response struct. |
+| `internal/server/handlers.go` | Fix the client-certificate block in `handleRoot`. |
+| `internal/server/whoami_test.go` | New. Handshake-level tests. |
+| `internal/server/server_test.go` | Probes and existing routes under `ClientCAs`. |
+| `cmd/goweb-https/main.go` | Load the pool, pass it, log it. |
+| `hack/gencerts/main.go` | `-client-ca` mode. |
+| `Makefile` | `certs-client` target. |
+| `README.md` | Configuration, endpoints, contract table, example. |
+
+## Definition of done
+
+- `make test` passes with `-race`.
+- `make lint` passes.
+- `go test -cover ./internal/clientauth/...` and `./internal/server/...`
+  hold at or above the current 90.6% for `internal/server`.
+- With `GOWEB_MTLS_CLIENT_CA` unset, every existing endpoint behaves
+  byte-identically to `main`.
+- The README contract table matches what the code actually does.
