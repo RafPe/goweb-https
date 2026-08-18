@@ -54,6 +54,12 @@ func handleStatus(deps Dependencies) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		report := buildStatus(deps, r)
 
+		// The representation depends on Accept - see prefersJSON - so a cache
+		// or proxy sitting in front of this endpoint must not serve the JSON
+		// body to a client that asked for the human page, or vice versa.
+		// /status.json has exactly one representation and does not need this.
+		w.Header().Set("Vary", "Accept")
+
 		// A client that explicitly asked for JSON gets JSON from this path too,
 		// so a scraper that cannot be pointed at a different URL still has a
 		// machine-readable option. Anything else - including the Accept: */*

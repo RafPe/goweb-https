@@ -297,6 +297,94 @@ func TestWhoamiJSON_RefusalIsExplicit(t *testing.T) {
 	}
 }
 
+// TestWhoami_CacheControl checks that every /whoami and /whoami.json
+// response - authenticated and refused alike - carries Cache-Control:
+// no-store. A refusal is as cacheable as a success to an intermediary, and a
+// cached 403 served to a client that did present a certificate would be just
+// as wrong as leaking one client's identity to another.
+func TestWhoami_CacheControl(t *testing.T) {
+	t.Parallel()
+
+	serverCert, roots := testCertificate(t)
+	clientCAs, trustedClient := testClientCertificate(t)
+	srv := newTestServer(t, serverCert, roots, clientCAs)
+
+	tests := map[string]struct {
+		client *tls.Certificate
+		target string
+		accept string
+	}{
+		"whoami.json authenticated":        {client: trustedClient, target: "/whoami.json"},
+		"whoami.json refusal":              {client: nil, target: "/whoami.json"},
+		"whoami text authenticated":        {client: trustedClient, target: "/whoami"},
+		"whoami text refusal":              {client: nil, target: "/whoami"},
+		"whoami Accept:json authenticated": {client: trustedClient, target: "/whoami", accept: "application/json"},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+tc.target, nil)
+			if err != nil {
+				t.Fatalf("build request: %v", err)
+			}
+			if tc.accept != "" {
+				req.Header.Set("Accept", tc.accept)
+			}
+
+			resp, err := tlsClient(roots, tc.client).Do(req)
+			if err != nil {
+				t.Fatalf("GET %s returned %v, want no error", tc.target, err)
+			}
+			defer resp.Body.Close()
+
+			if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+				t.Errorf("Cache-Control = %q, want %q", got, "no-store")
+			}
+		})
+	}
+}
+
+// TestWhoami_VaryAccept checks that /whoami, which changes representation
+// based on Accept (see prefersJSON), advertises that to caches - and that
+// /whoami.json, which has exactly one representation, does not.
+func TestWhoami_VaryAccept(t *testing.T) {
+	t.Parallel()
+
+	serverCert, roots := testCertificate(t)
+	clientCAs, trustedClient := testClientCertificate(t)
+	srv := newTestServer(t, serverCert, roots, clientCAs)
+
+	tests := map[string]struct {
+		target   string
+		wantVary bool
+	}{
+		"whoami":      {target: "/whoami", wantVary: true},
+		"whoami.json": {target: "/whoami.json", wantVary: false},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			resp, err := tlsClient(roots, trustedClient).Get(srv.URL + tc.target)
+			if err != nil {
+				t.Fatalf("GET %s returned %v, want no error", tc.target, err)
+			}
+			defer resp.Body.Close()
+
+			got := resp.Header.Get("Vary")
+			if tc.wantVary && got != "Accept" {
+				t.Errorf("Vary = %q, want %q", got, "Accept")
+			}
+			if !tc.wantVary && got != "" {
+				t.Errorf("Vary = %q, want unset", got)
+			}
+		})
+	}
+}
+
 // TestRootShowsSNIAndVerifiedClient checks the two consistency changes to
 // handleRoot: SNI is a property of every TLS request and must show up even
 // without a client certificate, and the client identity it does report comes
