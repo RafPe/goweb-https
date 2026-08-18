@@ -168,6 +168,51 @@ func TestLoadFrom_ReportsAllProblems(t *testing.T) {
 	}
 }
 
+func TestLoadFromClientCA(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		env       map[string]string
+		want      string
+		wantError bool
+	}{
+		"unset means disabled": {
+			env:  map[string]string{},
+			want: "",
+		},
+		"set names the trust store": {
+			env:  map[string]string{"GOWEB_MTLS_CLIENT_CA": "/tls/client-ca.pem"},
+			want: "/tls/client-ca.pem",
+		},
+		"set but empty is an operator mistake": {
+			env:       map[string]string{"GOWEB_MTLS_CLIENT_CA": ""},
+			wantError: true,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			cfg, err := LoadFrom(env(test.env))
+
+			if test.wantError {
+				if err == nil {
+					t.Fatal("LoadFrom returned no error, want one")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("LoadFrom returned %v, want no error", err)
+			}
+			if cfg.ClientCAFile != test.want {
+				t.Errorf("ClientCAFile = %q, want %q", cfg.ClientCAFile, test.want)
+			}
+		})
+	}
+}
+
 func TestLoadFrom_Overrides(t *testing.T) {
 	t.Parallel()
 
