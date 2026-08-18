@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -43,14 +44,16 @@ func run(ctx context.Context) error {
 	// from the served certificate, and a restart is an acceptable way to
 	// pick up a new one.
 	var (
-		clientCAs        *x509.CertPool
-		clientCASubjects []string
+		clientCAs    *x509.CertPool
+		trustAnchors []clientauth.Anchor
 	)
 	if cfg.ClientCAFile != "" {
-		clientCAs, clientCASubjects, err = clientauth.LoadPool(cfg.ClientCAFile)
+		trustStore, err := clientauth.LoadTrustStore(cfg.ClientCAFile)
 		if err != nil {
-			return err
+			return fmt.Errorf("load client CA trust store: %w", err)
 		}
+		clientCAs = trustStore.Pool()
+		trustAnchors = trustStore.Anchors()
 	}
 
 	reloader, err := certreload.New(cfg.CertificateFile, cfg.KeyFile,
@@ -104,13 +107,35 @@ func run(ctx context.Context) error {
 		"shutdown_timeout", cfg.ShutdownTimeout,
 		"client_certificate_verification", cfg.ClientCAFile != "",
 		"client_ca_file", cfg.ClientCAFile,
-		"client_ca_subjects", clientCASubjects,
+		"client_ca_trust_anchors", trustAnchorLogFields(trustAnchors),
 	)
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	return runComponents(ctx, srv.Run, reloader.Watch)
+}
+
+// trustAnchorLogField is the shape one client CA takes in the startup log.
+//
+// Subject alone is not enough to tell rotated CAs apart, since a
+// replacement commonly reuses the same subject DN as the CA it replaces;
+// the fingerprint is what lets an operator confirm which certificate is
+// actually trusted.
+type trustAnchorLogField struct {
+	Subject     string `json:"subject"`
+	Fingerprint string `json:"fingerprint_sha256"`
+}
+
+// trustAnchorLogFields projects trust anchors down to what the startup log
+// needs, so logging them costs nothing beyond the fields a reader actually
+// uses to tell one CA from another.
+func trustAnchorLogFields(anchors []clientauth.Anchor) []trustAnchorLogField {
+	fields := make([]trustAnchorLogField, len(anchors))
+	for i, anchor := range anchors {
+		fields[i] = trustAnchorLogField{Subject: anchor.Subject, Fingerprint: anchor.FingerprintSHA256}
+	}
+	return fields
 }
 
 // runComponents runs each component until one returns, then cancels the rest
