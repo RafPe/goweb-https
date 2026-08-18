@@ -68,6 +68,10 @@ lint-config: golangci-lint ## Verify the golangci-lint configuration.
 certs: ## Regenerate the self-signed demo certificates.
 	go run ./hack/gencerts
 
+.PHONY: certs-client
+certs-client: ## Generate a client CA and client certificate for mTLS testing.
+	go run ./hack/gencerts -client-ca
+
 ##@ Build
 
 .PHONY: build

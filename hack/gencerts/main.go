@@ -30,10 +30,11 @@ func main() {
 		commonName = flag.String("common-name", "*.raf.tech", "certificate common name")
 		dnsNames   = flag.String("dns-names", "*.raf.tech,raf.tech", "comma-separated DNS subject alternative names")
 		validFor   = flag.Duration("valid-for", 10*365*24*time.Hour, "how long the certificate stays valid")
+		clientCA   = flag.Bool("client-ca", false, "also emit a client CA and a client certificate signed by it")
 	)
 	flag.Parse()
 
-	if err := run(*dir, *commonName, splitAndTrim(*dnsNames), *validFor); err != nil {
+	if err := run(*dir, *commonName, splitAndTrim(*dnsNames), *validFor, *clientCA); err != nil {
 		log.Fatalf("generate demo certificates: %v", err)
 	}
 }
@@ -83,7 +84,7 @@ func pemPair(c *issued) (certPEM, keyPEM []byte, err error) {
 		nil
 }
 
-func run(dir, commonName string, dnsNames []string, validFor time.Duration) error {
+func run(dir, commonName string, dnsNames []string, validFor time.Duration, clientCA bool) error {
 	now := time.Now()
 	template := x509.Certificate{
 		Subject:   pkix.Name{CommonName: commonName},
@@ -121,6 +122,52 @@ func run(dir, commonName string, dnsNames []string, validFor time.Duration) erro
 		// layout GOWEB_X509_BUNDLE expects.
 		"bundle.pem": append(append([]byte{}, keyPEM...), certPEM...),
 	}
+
+	if clientCA {
+		caTemplate := x509.Certificate{
+			Subject:               pkix.Name{CommonName: "goweb-client-ca"},
+			NotBefore:             now.Add(-time.Hour),
+			NotAfter:              now.Add(validFor),
+			KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+			BasicConstraintsValid: true,
+			IsCA:                  true,
+		}
+		ca, err := issue(&caTemplate, nil)
+		if err != nil {
+			return fmt.Errorf("client CA: %w", err)
+		}
+
+		// A client leaf: ClientAuth only, so it cannot be mistaken for, or used
+		// as, a server certificate.
+		clientTemplate := x509.Certificate{
+			Subject:               pkix.Name{CommonName: "goweb-client"},
+			NotBefore:             now.Add(-time.Hour),
+			NotAfter:              now.Add(validFor),
+			KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+			ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+			BasicConstraintsValid: true,
+			IsCA:                  false,
+		}
+		client, err := issue(&clientTemplate, ca)
+		if err != nil {
+			return fmt.Errorf("client certificate: %w", err)
+		}
+
+		caCertPEM, caKeyPEM, err := pemPair(ca)
+		if err != nil {
+			return err
+		}
+		clientCertPEM, clientKeyPEM, err := pemPair(client)
+		if err != nil {
+			return err
+		}
+
+		files["client-ca.pem"] = caCertPEM
+		files["client-ca-key.pem"] = caKeyPEM
+		files["client.pem"] = clientCertPEM
+		files["client-key.pem"] = clientKeyPEM
+	}
+
 	for name, content := range files {
 		path := filepath.Join(dir, name)
 		mode := os.FileMode(0o644)
