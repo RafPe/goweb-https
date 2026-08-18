@@ -36,6 +36,7 @@ the variable, rather than being silently ignored.
 | GOWEB_MAX_STALE_PERIOD | `15m` | How long the source may be unreadable before `/readyz` fails. |
 | GOWEB_ALLOW_EXPIRED_CERTIFICATE | `false` | Start with an already-expired certificate and report it instead of exiting. |
 | POD_NAME / POD_NAMESPACE | – | Shown on `/status`. |
+| GOWEB_MTLS_CLIENT_CA | _(unset)_ | PEM file of client CA certificates. Setting it enables client-certificate verification; leaving it unset disables it entirely. |
 
 # Endpoints
 
@@ -44,6 +45,8 @@ the variable, rather than being silently ignored.
 | `/` | Landing page showing host, time, and peer certificate details. |
 | `/status` | Human-readable certificate and process diagnostics. |
 | `/status.json` | The same information as plain JSON, for machine consumers. |
+| `/whoami` | The client certificate the server verified, as a human-readable page. `403` when the caller presented none. |
+| `/whoami.json` | The same, as JSON. Always carries an `authenticated` boolean. |
 | `/livez` | Liveness. Reports only that the HTTP loop is running. |
 | `/readyz` | Readiness. Fails when no usable certificate exists, when the served certificate is outside its validity period, or when the source has been unreadable for longer than `GOWEB_MAX_STALE_PERIOD`. |
 
@@ -115,6 +118,67 @@ Notes for consumers:
 > is not fixed by restarting the process, which is why it degrades readiness
 > rather than liveness.
 
+# Client certificate authentication
+
+Client-certificate verification is off unless `GOWEB_MTLS_CLIENT_CA` is set.
+It is a listener-wide setting — every TLS handshake on the port may present a
+client certificate — but only `/whoami` and `/whoami.json` require one.
+`/livez`, `/readyz`, `/status`, `/status.json` and `/` are unaffected whether
+or not a client certificate is configured or presented, so Kubernetes probes
+keep working unchanged.
+
+Because a client certificate is only ever optional at the TLS layer, there
+are three observable outcomes, not two:
+
+| Client behaviour | Result |
+| --- | --- |
+| No client certificate | TLS succeeds; `GET /whoami` returns `403` |
+| Certificate not signed by a configured CA | TLS handshake fails; no HTTP response (curl exits `56`, `tlsv1 alert unknown ca`) |
+| Certificate signed by a configured CA | TLS succeeds; `GET /whoami` returns `200` |
+
+The middle row is not a `403`. An untrusted client certificate aborts the TLS
+handshake before any HTTP request is ever read, so nothing about the
+response can be inspected — an external suite has to assert on a connection
+error there, not on a status code.
+
+The trust store named by `GOWEB_MTLS_CLIENT_CA` is read once, at startup. A
+file that cannot be read, or that contains no PEM certificate, fails startup
+outright rather than silently leaving client-certificate verification
+disabled. Replacing the trust store — adding or removing a trusted CA —
+requires restarting the process; unlike the served certificate, it is not
+watched for changes.
+
+Generate a client CA and a client certificate signed by it, then call the
+endpoint the way an external suite would:
+
+```bash
+make certs-client
+
+GOWEB_MTLS_CLIENT_CA=./certs/client-ca.pem ./bin/goweb-https &
+
+curl --cacert ./certs/demo.pem \
+     --cert ./certs/client.pem --key ./certs/client-key.pem \
+     https://localhost:8443/whoami.json
+```
+
+```json
+{"authenticated":true,"client":{"subject":"CN=goweb-client","issuer":"CN=goweb-client-ca","serial":"338166764635016458982713045992107339775","fingerprint_sha256":"daea6cff6f9f135c687aebc6eb676f722ffab83d7e6993fb824f7802b977cd05","dns_names":[],"uris":[],"email_addresses":[],"ip_addresses":[],"not_before":"2026-08-18T03:42:33Z","not_after":"2036-08-15T04:42:33Z","expires_in_seconds":315359983,"chain":["CN=goweb-client","CN=goweb-client-ca"]}}
+```
+
+Without a client certificate, `/whoami.json` returns `403` and:
+
+```json
+{"authenticated":false,"reason":"no client certificate presented"}
+```
+
+Both are single-line, compact JSON — no indentation, no spaces after `:` or
+`,` — unlike `/status.json`. `/status` is read by operators in a terminal,
+where indentation earns its bytes; `/whoami` exists to be matched, logged and
+diffed by e2e suites in other repositories, where layout is noise. Every
+response body is followed by exactly one trailing newline. `authenticated`
+is always present, so a consumer can branch on one field rather than on the
+absence of another.
+
 # Certificate reloading
 
 The certificate is reloaded while the server runs, without dropping connections:
@@ -176,11 +240,12 @@ the bump.
 # Development
 
 ```bash
-make test    # go test -race -cover ./...
-make lint    # golangci-lint, installed into ./bin on first use
-make build   # binary into ./bin/server
-make run     # run from source
-make certs   # regenerate the self-signed demo certificates
+make test         # go test -race -cover ./...
+make lint         # golangci-lint, installed into ./bin on first use
+make build        # binary into ./bin/server
+make run          # run from source
+make certs        # regenerate the self-signed demo certificates
+make certs-client # generate a client CA and client certificate for mTLS testing
 ```
 
 `make docker-build` and `make docker-push` still exist for local use, but
