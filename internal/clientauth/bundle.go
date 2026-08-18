@@ -285,7 +285,7 @@ func (b *Bundle) Reconcile() (bool, error) {
 
 	b.logger.Info("client CA trust bundle reloaded",
 		"client_ca_file", b.path,
-		"anchors", anchorLogFields(store.anchors),
+		"anchors", AnchorLogFields(store.anchors),
 	)
 
 	b.notify(store.Pool())
@@ -390,17 +390,25 @@ func anchorDigest(anchors []Anchor) [sha256.Size]byte {
 	return [sha256.Size]byte(digest.Sum(nil))
 }
 
-// anchorLogField is the shape one trust anchor takes in a log line: enough to
+// AnchorLogField is the shape one trust anchor takes in a log line: enough to
 // tell an operator which CA is live, and no more.
-type anchorLogField struct {
+//
+// Subject alone is not enough, since a replacement CA commonly reuses the
+// subject DN of the CA it replaces; the fingerprint is what lets a reader
+// confirm which certificate is actually trusted.
+type AnchorLogField struct {
 	Subject     string `json:"subject"`
 	Fingerprint string `json:"fingerprint_sha256"`
 }
 
-func anchorLogFields(anchors []Anchor) []anchorLogField {
-	fields := make([]anchorLogField, len(anchors))
+// AnchorLogFields projects trust anchors down to what a log line needs, so
+// logging them costs nothing beyond the fields a reader actually uses to tell
+// one CA from another. It is shared by the startup log and the reload log so
+// the two cannot drift.
+func AnchorLogFields(anchors []Anchor) []AnchorLogField {
+	fields := make([]AnchorLogField, len(anchors))
 	for i, anchor := range anchors {
-		fields[i] = anchorLogField{Subject: anchor.Subject, Fingerprint: anchor.FingerprintSHA256}
+		fields[i] = AnchorLogField{Subject: anchor.Subject, Fingerprint: anchor.FingerprintSHA256}
 	}
 	return fields
 }
