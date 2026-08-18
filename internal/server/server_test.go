@@ -87,9 +87,15 @@ func TestRoutes(t *testing.T) {
 		target     string
 		wantStatus int
 	}{
-		"root":                {method: http.MethodGet, target: "/", wantStatus: http.StatusOK},
-		"status":              {method: http.MethodGet, target: "/status", wantStatus: http.StatusOK},
-		"status json":         {method: http.MethodGet, target: "/status.json", wantStatus: http.StatusOK},
+		"root":        {method: http.MethodGet, target: "/", wantStatus: http.StatusOK},
+		"status":      {method: http.MethodGet, target: "/status", wantStatus: http.StatusOK},
+		"status json": {method: http.MethodGet, target: "/status.json", wantStatus: http.StatusOK},
+		// No TLS on a request built by httptest.NewRequest, so these refuse -
+		// the same "no certificate" path TestWhoamiJSON_RefusalIsExplicit
+		// covers in detail. Listed here for the same reason every other route
+		// is: routing itself is method-scoped and reachable.
+		"whoami":              {method: http.MethodGet, target: "/whoami", wantStatus: http.StatusForbidden},
+		"whoami json":         {method: http.MethodGet, target: "/whoami.json", wantStatus: http.StatusForbidden},
 		"livez":               {method: http.MethodGet, target: "/livez", wantStatus: http.StatusOK},
 		"readyz":              {method: http.MethodGet, target: "/readyz", wantStatus: http.StatusOK},
 		"unknown path":        {method: http.MethodGet, target: "/nope", wantStatus: http.StatusNotFound},

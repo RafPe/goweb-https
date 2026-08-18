@@ -38,8 +38,13 @@ func TestWhoami(t *testing.T) {
 			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
 		}
 
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+
 		var report WhoamiReport
-		if err := json.NewDecoder(resp.Body).Decode(&report); err != nil {
+		if err := json.Unmarshal(body, &report); err != nil {
 			t.Fatalf("decode body: %v", err)
 		}
 		if !report.Authenticated {
@@ -53,6 +58,87 @@ func TestWhoami(t *testing.T) {
 		}
 		if len(report.Client.Chain) < 2 {
 			t.Errorf("Chain = %v, want the leaf and its issuer", report.Client.Chain)
+		}
+
+		// Decoding into WhoamiReport above proves the values round-trip
+		// through whatever struct produced them - it cannot catch a renamed
+		// json tag, because the same struct decodes its own output either
+		// way. Decoding into a bare map instead checks the wire contract
+		// itself: the exact key names an external, non-Go consumer depends
+		// on.
+		var wire map[string]any
+		if err := json.Unmarshal(body, &wire); err != nil {
+			t.Fatalf("decode body as map: %v", err)
+		}
+		if authenticated, ok := wire["authenticated"].(bool); !ok || !authenticated {
+			t.Errorf(`wire["authenticated"] = %#v, want true`, wire["authenticated"])
+		}
+		clientWire, ok := wire["client"].(map[string]any)
+		if !ok {
+			t.Fatalf(`wire["client"] = %#v, want an object`, wire["client"])
+		}
+		for _, key := range []string{"subject", "issuer", "serial", "fingerprint_sha256", "expires_in_seconds", "chain"} {
+			if _, ok := clientWire[key]; !ok {
+				t.Errorf("wire[\"client\"] is missing key %q: %v", key, clientWire)
+			}
+		}
+
+		// expires_in_seconds is derived at render time from deps.Now(), not
+		// stored on Identity. testDeps pins Now to a fixed instant while the
+		// certificate's NotAfter comes from the real clock, so the two are
+		// computed independently here and compared exactly: a switch to
+		// time.Now() in the handler would miss by the gap between testNow and
+		// the real clock, which is unmistakably large rather than a rounding
+		// difference.
+		wantExpires := float64(int64(trustedClient.Leaf.NotAfter.Sub(testNow).Seconds()))
+		if got := clientWire["expires_in_seconds"]; got != wantExpires {
+			t.Errorf(`wire["client"]["expires_in_seconds"] = %v, want %v`, got, wantExpires)
+		}
+	})
+
+	t.Run("trusted client certificate renders the human page", func(t *testing.T) {
+		resp, err := tlsClient(roots, trustedClient).Get(srv.URL + "/whoami")
+		if err != nil {
+			t.Fatalf("GET /whoami returned %v, want no error", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if !strings.Contains(string(body), "test-client") {
+			t.Errorf("human page does not mention the client subject\n%s", body)
+		}
+	})
+
+	t.Run("Accept: application/json is honoured on the human path", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/whoami", nil)
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := tlsClient(roots, trustedClient).Do(req)
+		if err != nil {
+			t.Fatalf("GET /whoami returned %v, want no error", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+		}
+
+		var wire map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&wire); err != nil {
+			t.Fatalf("/whoami with Accept: application/json did not return JSON: %v", err)
+		}
+		if _, ok := wire["client"]; !ok {
+			t.Errorf(`wire is missing "client": %v`, wire)
 		}
 	})
 
@@ -95,12 +181,19 @@ func TestWhoami(t *testing.T) {
 	})
 }
 
+// TestWhoamiWithoutTrustStore proves the trust store, not the certificate,
+// gates verification. The client presents the same valid certificate that
+// TestWhoami's "trusted client certificate is reported" subtest gets a 200
+// for - the only thing different here is that the server has no ClientCAs
+// configured. If this dialled with no certificate instead, a 403 would be
+// unsurprising and wouldn't say anything about ClientCAs at all.
 func TestWhoamiWithoutTrustStore(t *testing.T) {
 	serverCert, roots := testCertificate(t)
+	_, client := testClientCertificate(t)
+
 	srv := newTestServer(t, serverCert, roots, nil)
 
-	client := tlsClient(roots, nil)
-	resp, err := client.Get(srv.URL + "/whoami")
+	resp, err := tlsClient(roots, client).Get(srv.URL + "/whoami")
 	if err != nil {
 		t.Fatalf("GET /whoami returned %v, want no error", err)
 	}
@@ -108,6 +201,38 @@ func TestWhoamiWithoutTrustStore(t *testing.T) {
 
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusForbidden)
+	}
+}
+
+// TestWhoamiJSON_RefusalIsExplicit fetches the refusal document itself,
+// rather than only the success document (as TestWhoami's JSON subtest does)
+// or the text refusal (as its "no client certificate is refused" subtest
+// does). Without this, an `omitempty` added to WhoamiReport.Authenticated
+// would drop the field from exactly this response and nothing would notice:
+// the refusal JSON was never actually fetched by any test.
+func TestWhoamiJSON_RefusalIsExplicit(t *testing.T) {
+	t.Parallel()
+
+	rec := do(t, routes(testDeps(healthyProvider())), http.MethodGet, "/whoami.json")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+
+	var wire map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &wire); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+
+	authenticated, ok := wire["authenticated"]
+	if !ok {
+		t.Fatal(`wire is missing "authenticated"`)
+	}
+	if authenticated != false {
+		t.Errorf(`wire["authenticated"] = %#v, want false`, authenticated)
+	}
+	// The literal string is contract: external suites match on it.
+	if got, want := wire["reason"], noClientCertificate; got != want {
+		t.Errorf(`wire["reason"] = %#v, want %q`, got, want)
 	}
 }
 
