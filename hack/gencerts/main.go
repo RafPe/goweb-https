@@ -100,6 +100,15 @@ func pemPair(c *issued) (certPEM, keyPEM []byte, err error) {
 }
 
 func run(dir, commonName string, dnsNames []string, validFor time.Duration, clientCA bool) error {
+	// A non-positive window produces a certificate whose NotAfter is at or
+	// before its NotBefore - already expired the moment it is written, or
+	// invalid outright - which every TLS client will reject. Catching it
+	// here gives a caller a clear reason instead of a mysterious handshake
+	// failure once the material is deployed.
+	if validFor <= 0 {
+		return fmt.Errorf("valid-for must be positive, got %s", validFor)
+	}
+
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
@@ -124,8 +133,15 @@ func writeServerMaterial(dir, commonName string, dnsNames []string, validFor tim
 		// A server leaf, not a CA. The previous regeneration produced
 		// CA:TRUE with no key usage at all, which does not model the profile
 		// this project exists to demonstrate.
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		//
+		// ServerAuth only: this fixture demonstrates a server-only leaf, and
+		// ClientAuth here is what previously made it possible to point
+		// GOWEB_MTLS_CLIENT_CA at the committed certs/demo-key.pem and
+		// authenticate as a verified client. KeyEncipherment is dropped too:
+		// it exists for RSA key transport, which TLS 1.3 - the only protocol
+		// this server negotiates - never uses.
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 	}
@@ -224,15 +240,58 @@ func writeClientMaterial(dir string, validFor time.Duration) error {
 // keys and the combined bundle.
 func writeFiles(dir string, files map[string][]byte) error {
 	for name, content := range files {
-		path := filepath.Join(dir, name)
 		mode := os.FileMode(0o644)
 		if strings.Contains(name, "key") || name == "bundle.pem" {
 			mode = 0o600
 		}
-		if err := os.WriteFile(path, content, mode); err != nil {
-			return fmt.Errorf("write %s: %w", path, err)
+		if err := writeFileAtomic(dir, name, content, mode); err != nil {
+			return err
 		}
-		fmt.Printf("wrote %s\n", path)
+		fmt.Printf("wrote %s\n", filepath.Join(dir, name))
+	}
+	return nil
+}
+
+// writeFileAtomic writes content to dir/name by way of a temporary file that
+// is renamed into place once fully written.
+//
+// os.WriteFile's mode argument is only applied when the file is newly
+// created; it has no effect on a file that already exists. Regenerating
+// client-ca-key.pem - a CA signing key - over a copy that was previously
+// created 0o644 would therefore silently leave it world-readable, mode
+// argument notwithstanding. Going through a temp file sidesteps that: the
+// temp file is created fresh, so os.CreateTemp's own restrictive 0o600
+// default mode applies, and it is set to the caller's mode before any
+// content is written to it - so an empty file never sits at a mode wider
+// than its final one with content in it. The rename is also what makes the
+// write atomic: a reader opening dir/name either sees the previous complete
+// file or the new complete one, never a partially written certificate.
+func writeFileAtomic(dir, name string, content []byte, mode os.FileMode) (err error) {
+	tmp, err := os.CreateTemp(dir, "."+name+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp file for %s: %w", name, err)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if err = tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("chmod %s: %w", tmpPath, err)
+	}
+	if _, err = tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write %s: %w", tmpPath, err)
+	}
+	if err = tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", tmpPath, err)
+	}
+
+	if err = os.Rename(tmpPath, filepath.Join(dir, name)); err != nil {
+		return fmt.Errorf("rename %s to %s: %w", tmpPath, name, err)
 	}
 	return nil
 }
