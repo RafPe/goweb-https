@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/RafPe/goweb-https/internal/clientauth"
 )
 
 // expiryWarningThreshold is how close to expiry a certificate must be before
@@ -21,14 +23,22 @@ func handleRoot(deps Dependencies) http.HandlerFunc {
 		fmt.Fprintf(&b, "⏰ Time: %s\n", formatTime(deps.Now(), deps.Location))
 		fmt.Fprintf(&b, "🌐 Client IP: %s\n", r.RemoteAddr)
 
-		if state := r.TLS; state != nil && len(state.PeerCertificates) > 0 {
-			peer := state.PeerCertificates[0]
-			fmt.Fprintf(&b, "🔐 SNI: %s\n", state.ServerName)
-			fmt.Fprintf(&b, "📜 Certificate CN: %s\n", peer.Subject.CommonName)
-			fmt.Fprintf(&b, "🏷️ Certificate SANs: %v\n", peer.DNSNames)
-			fmt.Fprintf(&b, "⏳ Certificate Valid: %s to %s\n",
-				formatTime(peer.NotBefore, deps.Location),
-				formatTime(peer.NotAfter, deps.Location))
+		// SNI is a property of every TLS request, not only of requests that
+		// carry a client certificate - it used to be printed inside the
+		// certificate branch, where it never appeared at all.
+		if r.TLS != nil {
+			fmt.Fprintf(&b, "🔐 SNI: %s\n", r.TLS.ServerName)
+		}
+
+		// Read through clientauth so that one place in the codebase decides
+		// what "the verified client" means, and so this stays correct if the
+		// listener's ClientAuth setting ever changes.
+		if identity, ok := clientauth.IdentityFrom(r.TLS); ok {
+			fmt.Fprintf(&b, "📜 Client Certificate Subject: %s\n", identity.Subject)
+			fmt.Fprintf(&b, "🏷️ Client Certificate SANs: %v\n", identity.DNSNames)
+			fmt.Fprintf(&b, "⏳ Client Certificate Valid: %s to %s\n",
+				formatTime(identity.NotBefore, deps.Location),
+				formatTime(identity.NotAfter, deps.Location))
 		}
 
 		writeText(w, http.StatusOK, b.String())

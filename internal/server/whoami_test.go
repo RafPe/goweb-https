@@ -279,6 +279,51 @@ func TestWhoamiJSON_RefusalIsExplicit(t *testing.T) {
 	}
 }
 
+// TestRootShowsSNIAndVerifiedClient checks the two consistency changes to
+// handleRoot: SNI is a property of every TLS request and must show up even
+// without a client certificate, and the client identity it does report comes
+// from clientauth.IdentityFrom rather than an unverified peer certificate.
+func TestRootShowsSNIAndVerifiedClient(t *testing.T) {
+	serverCert, roots := testCertificate(t)
+	clientCAs, trustedClient := testClientCertificate(t)
+	srv := newTestServer(t, serverCert, roots, clientCAs)
+
+	t.Run("SNI is shown without a client certificate", func(t *testing.T) {
+		resp, err := tlsClient(roots, nil).Get(srv.URL + "/")
+		if err != nil {
+			t.Fatalf("GET / returned %v, want no error", err)
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if !strings.Contains(string(body), "SNI:") {
+			t.Errorf("body did not mention SNI; got:\n%s", body)
+		}
+		if strings.Contains(string(body), "Client Certificate") {
+			t.Errorf("body reported a client certificate when none was sent; got:\n%s", body)
+		}
+	})
+
+	t.Run("a verified client certificate is shown", func(t *testing.T) {
+		resp, err := tlsClient(roots, trustedClient).Get(srv.URL + "/")
+		if err != nil {
+			t.Fatalf("GET / returned %v, want no error", err)
+		}
+		defer resp.Body.Close()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		if !strings.Contains(string(body), "test-client") {
+			t.Errorf("body did not report the client subject; got:\n%s", body)
+		}
+	})
+}
+
 // testClientCertificate issues a clientAuth leaf, "test-client", from a
 // throwaway CA distinct from the server's, and returns a pool trusting that
 // CA together with the leaf.
