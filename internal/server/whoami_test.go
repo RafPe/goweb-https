@@ -78,10 +78,28 @@ func TestWhoami(t *testing.T) {
 		if !ok {
 			t.Fatalf(`wire["client"] = %#v, want an object`, wire["client"])
 		}
-		for _, key := range []string{"subject", "issuer", "serial", "fingerprint_sha256", "expires_in_seconds", "chain"} {
+		for _, key := range []string{
+			"subject", "issuer", "serial", "fingerprint_sha256", "expires_in_seconds", "chain",
+			"dns_names", "uris", "email_addresses", "ip_addresses", "not_before", "not_after",
+		} {
 			if _, ok := clientWire[key]; !ok {
 				t.Errorf("wire[\"client\"] is missing key %q: %v", key, clientWire)
 			}
+		}
+
+		// testClientCertificate's leaf carries no DNS SANs, so dns_names is
+		// exactly what emptyIfNil (whoami.go) turns from nil into []: this is
+		// the field, on this wire body, where that contract is actually
+		// exercised. Decoding into a map, as above, is what lets this tell []
+		// apart from null - a struct with a []string field decodes either one
+		// back to an empty slice, so asserting through WhoamiReport could not
+		// catch a regression here.
+		dnsNames, ok := clientWire["dns_names"].([]any)
+		if !ok {
+			t.Fatalf(`wire["client"]["dns_names"] = %#v, want a JSON array`, clientWire["dns_names"])
+		}
+		if len(dnsNames) != 0 {
+			t.Errorf(`wire["client"]["dns_names"] = %v, want an empty array`, dnsNames)
 		}
 
 		// expires_in_seconds is derived at render time from deps.Now(), not
