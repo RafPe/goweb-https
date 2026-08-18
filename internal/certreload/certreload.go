@@ -4,6 +4,11 @@
 // The read path is lock free: handshakes load an immutable snapshot through an
 // atomic pointer and perform no filesystem access, parsing, or locking. All
 // discovery happens on a separate goroutine driven by [Reloader.Watch].
+//
+// It also hosts [RunWatch], the rotation-watching loop that [Reloader.Watch] is
+// built from. The loop is exported so that the client CA trust bundle in
+// internal/clientauth can be driven by the same code rather than by a second
+// copy of it.
 package certreload
 
 import (
