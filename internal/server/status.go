@@ -195,11 +195,14 @@ func writeCompactJSON(w http.ResponseWriter, deps Dependencies, status int, v an
 }
 
 // writeJSONEncodeError reports a JSON encoding failure as a 500. Shared by
-// writeJSON and writeCompactJSON so the error path cannot drift between the
-// two encodings.
+// writeJSON and writeCompactJSON - and so by /status.json and /whoami.json
+// alike - so the error path cannot drift between the two encodings. The
+// message stays neutral across both endpoints rather than naming "status",
+// so a /whoami.json failure doesn't misreport itself as a status-encoding
+// problem.
 func writeJSONEncodeError(w http.ResponseWriter, deps Dependencies, err error) {
-	deps.Logger.Error("encoding status document failed", "err", err)
-	http.Error(w, `{"error":"failed to encode status"}`, http.StatusInternalServerError)
+	deps.Logger.Error("encoding JSON response failed", "err", err)
+	http.Error(w, `{"error":"failed to encode response"}`, http.StatusInternalServerError)
 }
 
 // writeJSONBody sends body as a complete JSON response. Shared by writeJSON
