@@ -538,6 +538,10 @@ func testClientCertificate(t *testing.T) (*x509.CertPool, *tls.Certificate) {
 // testServer is the minimal handle callers need from newTestServer.
 type testServer struct {
 	URL string
+
+	// server is the running Server, for tests that rotate its trust bundle
+	// while it is serving.
+	server *Server
 }
 
 // newTestServer starts a real listener through New() itself, the same
@@ -579,7 +583,7 @@ func newTestServer(t *testing.T, serverCert *tls.Certificate, roots *x509.CertPo
 		t.Fatalf("server did not become reachable: %v", err)
 	}
 
-	return &testServer{URL: url}
+	return &testServer{URL: url, server: srv}
 }
 
 // tlsClient builds an http.Client that trusts roots and, when cert is

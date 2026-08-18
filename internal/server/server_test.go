@@ -540,4 +540,10 @@ func TestClientAuthDisabledByDefault(t *testing.T) {
 	if got := srv.http.TLSConfig.ClientAuth; got != tls.NoClientCert {
 		t.Errorf("ClientAuth = %v, want tls.NoClientCert when no pool is configured", got)
 	}
+	// No hook either: with no trust store to reload there is nothing to derive
+	// a per-handshake config from, and this is the assertion that makes "the
+	// mTLS-off path is unchanged" checkable rather than assumed.
+	if srv.http.TLSConfig.GetConfigForClient != nil {
+		t.Error("GetConfigForClient is set when no pool is configured")
+	}
 }

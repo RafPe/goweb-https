@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,20 +39,19 @@ func run(ctx context.Context) error {
 		return err
 	}
 
-	// The trust store is loaded once. It changes on a different timescale
-	// from the served certificate, and a restart is an acceptable way to
-	// pick up a new one.
-	var (
-		clientCAs    *x509.CertPool
-		trustAnchors []clientauth.Anchor
-	)
+	// The trust store tracks its file the way the served certificate does: in
+	// Kubernetes it is a projected volume updated in place, so a restart is not
+	// an acceptable way to pick up a rotated bundle.
+	var trustBundle *clientauth.Bundle
 	if cfg.ClientCAFile != "" {
-		trustStore, err := clientauth.LoadTrustStore(cfg.ClientCAFile)
+		trustBundle, err = clientauth.NewBundle(cfg.ClientCAFile,
+			clientauth.WithLogger(logger),
+			clientauth.WithDebounce(cfg.ReloadDebounce),
+			clientauth.WithReconcileInterval(cfg.ReloadInterval),
+		)
 		if err != nil {
 			return fmt.Errorf("load client CA trust store: %w", err)
 		}
-		clientCAs = trustStore.Pool()
-		trustAnchors = trustStore.Anchors()
 	}
 
 	reloader, err := certreload.New(cfg.CertificateFile, cfg.KeyFile,
@@ -73,7 +71,7 @@ func run(ctx context.Context) error {
 		hostname = "unknown"
 	}
 
-	srv, err := server.New(cfg.Address, cfg.ShutdownTimeout, reloader.GetCertificate, server.Dependencies{
+	deps := server.Dependencies{
 		Certificates: reloader,
 		Logger:       logger,
 		Now:          time.Now,
@@ -82,10 +80,29 @@ func run(ctx context.Context) error {
 		PodName:      cfg.PodName,
 		PodNamespace: cfg.PodNamespace,
 		StartedAt:    time.Now(),
-		ClientCAs:    clientCAs,
-	})
+	}
+	// Assigned inside the guard rather than unconditionally: a nil *Bundle
+	// stored in the interface field would be a non-nil interface holding a nil
+	// pointer, and the status handler would report a trust bundle that does not
+	// exist rather than omitting the block.
+	var trustAnchors []clientauth.Anchor
+	if trustBundle != nil {
+		deps.ClientCAs = trustBundle.Pool()
+		deps.TrustBundle = trustBundle
+		trustAnchors = trustBundle.Anchors()
+	}
+
+	srv, err := server.New(cfg.Address, cfg.ShutdownTimeout, reloader.GetCertificate, deps)
 	if err != nil {
 		return err
+	}
+
+	// Registered after the server exists, so the first pool the server sees is
+	// the one New was given and every later one arrives through here. A
+	// rotation landing in the gap is not lost: the bundle's watcher reconciles
+	// once at startup, which is after this point.
+	if trustBundle != nil {
+		trustBundle.OnChange(srv.SetClientCAs)
 	}
 
 	if info, ok := reloader.CertificateInfo(); ok {
@@ -107,35 +124,24 @@ func run(ctx context.Context) error {
 		"shutdown_timeout", cfg.ShutdownTimeout,
 		"client_certificate_verification", cfg.ClientCAFile != "",
 		"client_ca_file", cfg.ClientCAFile,
-		"client_ca_trust_anchors", trustAnchorLogFields(trustAnchors),
+		"client_ca_trust_anchors", clientauth.AnchorLogFields(trustAnchors),
 	)
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return runComponents(ctx, srv.Run, reloader.Watch)
-}
-
-// trustAnchorLogField is the shape one client CA takes in the startup log.
-//
-// Subject alone is not enough to tell rotated CAs apart, since a
-// replacement commonly reuses the same subject DN as the CA it replaces;
-// the fingerprint is what lets an operator confirm which certificate is
-// actually trusted.
-type trustAnchorLogField struct {
-	Subject     string `json:"subject"`
-	Fingerprint string `json:"fingerprint_sha256"`
-}
-
-// trustAnchorLogFields projects trust anchors down to what the startup log
-// needs, so logging them costs nothing beyond the fields a reader actually
-// uses to tell one CA from another.
-func trustAnchorLogFields(anchors []clientauth.Anchor) []trustAnchorLogField {
-	fields := make([]trustAnchorLogField, len(anchors))
-	for i, anchor := range anchors {
-		fields[i] = trustAnchorLogField{Subject: anchor.Subject, Fingerprint: anchor.FingerprintSHA256}
+	// The trust bundle's watcher joins the same lifecycle as the certificate
+	// watcher and the server: a watcher that terminates means rotation is no
+	// longer observed and cannot recover without a restart, which the
+	// orchestrator should see as the process failing rather than as a silently
+	// degraded pod. Note this differs from the bundle merely being stale, which
+	// is reported and deliberately does not fail readiness.
+	components := []func(context.Context) error{srv.Run, reloader.Watch}
+	if trustBundle != nil {
+		components = append(components, trustBundle.Watch)
 	}
-	return fields
+
+	return runComponents(ctx, components...)
 }
 
 // runComponents runs each component until one returns, then cancels the rest
