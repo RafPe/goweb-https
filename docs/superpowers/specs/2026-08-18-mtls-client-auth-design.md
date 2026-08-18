@@ -234,6 +234,28 @@ Both strings are literal and are part of the contract. External suites
 will match on them, so they are asserted in the tests rather than left to
 whatever `fmt` produces.
 
+### Encoding: `/whoami` JSON is compact
+
+`/whoami.json`, and `/whoami` answering an explicit `Accept: application/json`,
+emit **compact** JSON on a single line — no indentation, no spaces after
+separators — followed by one trailing newline:
+
+```
+{"authenticated":false,"reason":"no client certificate presented"}
+```
+
+This deliberately diverges from `/status.json`, which stays indented via the
+existing `writeJSON`. The two endpoints have different audiences: `/status`
+is read by operators in a terminal, where indentation earns its bytes;
+`/whoami` exists to be consumed by e2e suites in other repositories, where
+layout is noise and a single line is easier to match, log and diff.
+
+The consequence for consumers is that a compact document is stable enough
+to compare as a string, so the JSON body joins the plain-text body as
+literal contract rather than merely structural. Tests still assert key
+names through a decoded `map[string]any` as well, because a decode-into-the-
+same-struct assertion cannot catch a renamed JSON tag.
+
 With a verified certificate, both return `200`. The JSON document is:
 
 ```json
