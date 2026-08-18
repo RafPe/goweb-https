@@ -18,7 +18,16 @@ type StatusReport struct {
 	Server      ServerStatus       `json:"server"`
 	Request     RequestStatus      `json:"request"`
 	Certificate *CertificateStatus `json:"certificate"`
-	Readiness   ReadinessStatus    `json:"readiness"`
+
+	// TrustBundle is omitted entirely when client-certificate verification is
+	// disabled, rather than rendered as null the way Certificate is. The two
+	// differ because they answer different questions: a pod always has a
+	// certificate slot, so "none loaded" is a state worth naming, whereas a pod
+	// without a trust bundle is not doing client verification at all and the
+	// block would have nothing to describe.
+	TrustBundle *TrustBundleStatus `json:"trust_bundle,omitempty"`
+
+	Readiness ReadinessStatus `json:"readiness"`
 }
 
 // ServerStatus describes the process.
@@ -64,6 +73,45 @@ type CertificateStatus struct {
 	ExpiresInSeconds int64 `json:"expires_in_seconds"`
 }
 
+// TrustBundleStatus describes the client CA trust bundle currently being
+// enforced.
+//
+// It exists so that a rotation is assertable. Without it a suite can only infer
+// that a reload landed by polling /whoami with a certificate and watching it
+// start or stop working - indirect, slow, and ambiguous when it fails.
+type TrustBundleStatus struct {
+	FilePath string              `json:"file_path"`
+	Anchors  []TrustAnchorStatus `json:"anchors"`
+
+	// LoadedAt is when the enforced bundle was read.
+	LoadedAt time.Time `json:"loaded_at"`
+
+	// LastSuccess is when the source was last read successfully, whether or not
+	// its content had changed.
+	LastSuccess time.Time `json:"last_success"`
+
+	// StaleSeconds is how long ago that was, so a scrape can alert on a single
+	// number. Unlike the certificate, staleness here is reported and never
+	// enforced: it does not fail readiness.
+	StaleSeconds int64 `json:"stale_seconds"`
+
+	// LastError describes the most recent reload failure and is empty once a
+	// reload succeeds again. A non-empty value means the pool being enforced is
+	// no longer the one on disk.
+	LastError string `json:"last_error"`
+}
+
+// TrustAnchorStatus describes one trusted client CA.
+//
+// The fingerprint is what makes the block useful: a rotation that replaces a CA
+// commonly preserves the subject DN, so a suite asserting that a rotation
+// landed cannot tell the new CA from the old one by subject alone.
+type TrustAnchorStatus struct {
+	Subject           string    `json:"subject"`
+	FingerprintSHA256 string    `json:"fingerprint_sha256"`
+	NotAfter          time.Time `json:"not_after"`
+}
+
 // ReadinessStatus mirrors what /readyz reports.
 type ReadinessStatus struct {
 	Ready  bool   `json:"ready"`
@@ -107,6 +155,11 @@ func buildStatus(deps Dependencies, r *http.Request) StatusReport {
 		report.Readiness = ReadinessStatus{Ready: true}
 	}
 
+	// Built before the no-certificate return below: a pod that has lost its
+	// serving certificate is exactly when an operator wants to see what else is
+	// loaded, and folding this in after that return would hide it.
+	report.TrustBundle = trustBundleStatus(deps, now)
+
 	info, ok := deps.Certificates.CertificateInfo()
 	if !ok {
 		// Explicitly null rather than an empty object: "no certificate" is a
@@ -131,6 +184,34 @@ func buildStatus(deps Dependencies, r *http.Request) StatusReport {
 	}
 
 	return report
+}
+
+// trustBundleStatus describes the trust bundle, or nil when
+// client-certificate verification is disabled.
+func trustBundleStatus(deps Dependencies, now time.Time) *TrustBundleStatus {
+	if deps.TrustBundle == nil {
+		return nil
+	}
+
+	status := deps.TrustBundle.Status()
+
+	anchors := make([]TrustAnchorStatus, 0, len(status.Anchors))
+	for _, anchor := range status.Anchors {
+		anchors = append(anchors, TrustAnchorStatus{
+			Subject:           anchor.Subject,
+			FingerprintSHA256: anchor.FingerprintSHA256,
+			NotAfter:          anchor.NotAfter,
+		})
+	}
+
+	return &TrustBundleStatus{
+		FilePath:     status.FilePath,
+		Anchors:      anchors,
+		LoadedAt:     status.LoadedAt,
+		LastSuccess:  status.LastSuccess,
+		StaleSeconds: int64(now.Sub(status.LastSuccess).Seconds()),
+		LastError:    status.LastError,
+	}
 }
 
 // validityCode renders the validity state as a stable JSON enum. It is

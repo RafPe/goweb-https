@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/RafPe/goweb-https/internal/certreload"
+	"github.com/RafPe/goweb-https/internal/clientauth"
 )
 
 // CertificateStatusProvider is the narrow view of the certificate reloader that
@@ -28,6 +30,18 @@ type CertificateStatusProvider interface {
 
 	// Ready reports whether the certificate source is healthy enough to serve.
 	Ready() error
+}
+
+// TrustBundleStatusProvider is the narrow view of the client CA trust bundle
+// that the handlers need.
+//
+// It is declared beside CertificateStatusProvider rather than folded into it
+// because the served identity and the trust store are independent sources with
+// independent health: widening the one interface would force the certificate
+// reloader to grow trust methods it has no business having.
+type TrustBundleStatusProvider interface {
+	// Status describes the trust bundle and how well it is tracking its source.
+	Status() clientauth.BundleStatus
 }
 
 // Dependencies carries the collaborators and process facts the handlers need.
@@ -47,6 +61,11 @@ type Dependencies struct {
 	// that need one always refuse.
 	ClientCAs *x509.CertPool
 
+	// TrustBundle reports the client CA trust bundle on the diagnostic
+	// endpoint. Nil when client-certificate verification is disabled, which is
+	// what makes the trust_bundle block absent rather than empty.
+	TrustBundle TrustBundleStatusProvider
+
 	// StartedAt is when serving began, which is what uptime should measure -
 	// not when the process happened to initialise its packages.
 	StartedAt time.Time
@@ -65,6 +84,17 @@ type Server struct {
 	http            *http.Server
 	logger          *slog.Logger
 	shutdownTimeout time.Duration
+
+	// baseTLS is the template every derived config is cloned from. It is built
+	// once, before the listener starts, and never mutated afterwards: a
+	// tls.Config must not be modified once it has been used. Nil when
+	// client-certificate verification is disabled.
+	baseTLS *tls.Config
+
+	// clientTLS holds the config handed to each handshake. A whole config is
+	// swapped rather than a field, because concurrent handshakes read the one
+	// they were given and mutating it underneath them is a data race.
+	clientTLS atomic.Pointer[tls.Config]
 }
 
 // New builds a Server listening on addr and serving TLS via getCertificate.
@@ -96,12 +126,8 @@ func New(addr string, shutdownTimeout time.Duration, getCertificate func(*tls.Cl
 		GetCertificate: getCertificate,
 		MinVersion:     tls.VersionTLS13,
 	}
-	if deps.ClientCAs != nil {
-		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
-		tlsConfig.ClientCAs = deps.ClientCAs
-	}
 
-	return &Server{
+	srv := &Server{
 		logger:          deps.Logger,
 		shutdownTimeout: shutdownTimeout,
 		http: &http.Server{
@@ -114,7 +140,64 @@ func New(addr string, shutdownTimeout time.Duration, getCertificate func(*tls.Cl
 			IdleTimeout:       idleTimeout,
 			ErrorLog:          slog.NewLogLogger(deps.Logger.Handler(), slog.LevelWarn),
 		},
-	}, nil
+	}
+
+	if deps.ClientCAs != nil {
+		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+		tlsConfig.ClientCAs = deps.ClientCAs
+
+		// The template is captured before the hook is installed, so a derived
+		// config never carries a self-reference back into this one.
+		srv.baseTLS = tlsConfig.Clone()
+		srv.clientTLS.Store(srv.baseTLS)
+		tlsConfig.GetConfigForClient = srv.configForClient
+	}
+
+	return srv, nil
+}
+
+// configForClient implements the tls.Config.GetConfigForClient callback.
+//
+// It performs an atomic load and nothing else: no filesystem access, parsing,
+// locking or logging happens on the handshake path. Handing the same config to
+// concurrent handshakes is safe because it is read only.
+func (s *Server) configForClient(*tls.ClientHelloInfo) (*tls.Config, error) {
+	return s.clientTLS.Load(), nil
+}
+
+// SetClientCAs publishes a new client CA trust pool, which subsequent
+// handshakes verify against. Already-established connections keep the pool they
+// were authenticated under; the change applies from the next handshake.
+//
+// It is the callback the trust bundle reloader invokes on a successful
+// rotation, and it is a no-op when client-certificate verification is disabled:
+// a rotation must not be able to switch verification on behind the operator's
+// back.
+//
+// A nil pool is refused rather than published. crypto/tls passes ClientCAs
+// straight into x509.VerifyOptions.Roots, and crypto/x509 substitutes the
+// system root pool when Roots is nil - so publishing nil here would not reject
+// every client but accept every publicly issued client certificate as a
+// verified identity. Retaining the last known good pool is the only safe answer
+// to being handed nothing.
+//
+// The new config is derived by cloning the base rather than being built from
+// scratch, because a config returned from GetConfigForClient replaces the base
+// wholesale: GetCertificate and MinVersion have to ride along, and cloning is
+// what stops them being lost by omission.
+func (s *Server) SetClientCAs(pool *x509.CertPool) {
+	if s.baseTLS == nil {
+		return
+	}
+	if pool == nil {
+		s.logger.Error("refusing to publish a nil client CA pool; retaining the previous trust store")
+		return
+	}
+
+	derived := s.baseTLS.Clone()
+	derived.ClientAuth = tls.VerifyClientCertIfGiven
+	derived.ClientCAs = pool
+	s.clientTLS.Store(derived)
 }
 
 // routes builds the request multiplexer.
