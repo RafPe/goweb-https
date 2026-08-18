@@ -4,12 +4,14 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -92,4 +94,89 @@ func TestLoadPool(t *testing.T) {
 			}
 		})
 	}
+}
+
+// leafCertificate returns a parsed self-signed leaf for use in a fake
+// connection state.
+func leafCertificate(t *testing.T, commonName string) *x509.Certificate {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(42),
+		Subject:      pkix.Name{CommonName: commonName},
+		DNSNames:     []string{"client.example"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
+	}
+	return cert
+}
+
+func TestIdentityFrom(t *testing.T) {
+	leaf := leafCertificate(t, "verified-client")
+
+	t.Run("nil connection state", func(t *testing.T) {
+		if _, ok := IdentityFrom(nil); ok {
+			t.Error("IdentityFrom(nil) reported an identity; want none")
+		}
+	})
+
+	t.Run("no peer certificate", func(t *testing.T) {
+		if _, ok := IdentityFrom(&tls.ConnectionState{}); ok {
+			t.Error("IdentityFrom reported an identity for a bare state; want none")
+		}
+	})
+
+	// The whole point of the package: a certificate the client presented but
+	// the server did not verify is not an identity. If this test ever passes
+	// an identity back, something started reading PeerCertificates.
+	t.Run("peer certificate present but unverified", func(t *testing.T) {
+		state := &tls.ConnectionState{PeerCertificates: []*x509.Certificate{leaf}}
+		if _, ok := IdentityFrom(state); ok {
+			t.Error("IdentityFrom reported an identity from an unverified certificate")
+		}
+	})
+
+	t.Run("verified chain", func(t *testing.T) {
+		state := &tls.ConnectionState{
+			PeerCertificates: []*x509.Certificate{leaf},
+			VerifiedChains:   [][]*x509.Certificate{{leaf}},
+		}
+
+		identity, ok := IdentityFrom(state)
+		if !ok {
+			t.Fatal("IdentityFrom reported no identity for a verified chain")
+		}
+		if got, want := identity.Subject, "CN=verified-client"; got != want {
+			t.Errorf("Subject = %q, want %q", got, want)
+		}
+		if got, want := identity.Serial, "42"; got != want {
+			t.Errorf("Serial = %q, want %q", got, want)
+		}
+		if len(identity.FingerprintSHA256) != 64 {
+			t.Errorf("FingerprintSHA256 = %q, want 64 hex characters", identity.FingerprintSHA256)
+		}
+		if got, want := identity.DNSNames, []string{"client.example"}; !slices.Equal(got, want) {
+			t.Errorf("DNSNames = %v, want %v", got, want)
+		}
+		if got, want := identity.Chain, []string{"CN=verified-client"}; !slices.Equal(got, want) {
+			t.Errorf("Chain = %v, want %v", got, want)
+		}
+	})
 }

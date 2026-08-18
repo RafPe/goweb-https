@@ -8,9 +8,13 @@
 package clientauth
 
 import (
+	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"time"
 )
 
 // LoadPool reads a PEM file of client CA certificates and returns a pool that
@@ -32,4 +36,66 @@ func LoadPool(path string) (*x509.CertPool, error) {
 	}
 
 	return pool, nil
+}
+
+// Identity describes a client certificate that the server verified.
+//
+// Every field is derived from the verified leaf, so a populated Identity
+// always means the handshake proved possession of the corresponding key.
+type Identity struct {
+	Subject           string
+	Issuer            string
+	Serial            string
+	FingerprintSHA256 string
+	DNSNames          []string
+	URIs              []string
+	EmailAddresses    []string
+	IPAddresses       []string
+	NotBefore         time.Time
+	NotAfter          time.Time
+
+	// Chain lists the verified chain by subject, leaf first.
+	Chain []string
+}
+
+// IdentityFrom extracts the verified client identity from state. The boolean
+// reports whether the client presented a certificate that the server verified.
+//
+// It reads VerifiedChains and never PeerCertificates. Under the listener's
+// tls.VerifyClientCertIfGiven setting the two agree, because an unverifiable
+// certificate aborts the handshake before any handler runs. They stop agreeing
+// the moment ClientAuth changes, and the failure mode of the wrong choice is
+// treating an unverified certificate as an identity - so this reads the field
+// that is safe under every setting.
+func IdentityFrom(state *tls.ConnectionState) (Identity, bool) {
+	if state == nil || len(state.VerifiedChains) == 0 || len(state.VerifiedChains[0]) == 0 {
+		return Identity{}, false
+	}
+
+	chain := state.VerifiedChains[0]
+	leaf := chain[0]
+	fingerprint := sha256.Sum256(leaf.Raw)
+
+	identity := Identity{
+		Subject:           leaf.Subject.String(),
+		Issuer:            leaf.Issuer.String(),
+		Serial:            leaf.SerialNumber.String(),
+		FingerprintSHA256: hex.EncodeToString(fingerprint[:]),
+		DNSNames:          leaf.DNSNames,
+		EmailAddresses:    leaf.EmailAddresses,
+		NotBefore:         leaf.NotBefore,
+		NotAfter:          leaf.NotAfter,
+	}
+
+	for _, uri := range leaf.URIs {
+		identity.URIs = append(identity.URIs, uri.String())
+	}
+	for _, ip := range leaf.IPAddresses {
+		identity.IPAddresses = append(identity.IPAddresses, ip.String())
+	}
+	for _, cert := range chain {
+		identity.Chain = append(identity.Chain, cert.Subject.String())
+	}
+
+	return identity, true
 }
