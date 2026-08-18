@@ -16,21 +16,20 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
 
-// caCertPEM generates a self-signed CA certificate with the given common name
-// and returns it PEM encoded.
-func caCertPEM(t *testing.T, commonName string) []byte {
-	t.Helper()
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-
-	template := x509.Certificate{
+// caTemplate returns a template for a client CA certificate that satisfies
+// every check LoadTrustStore makes: BasicConstraintsValid, IsCA, and
+// KeyUsageCertSign are all set, and the validity window covers now. Tests
+// that need an anchor LoadTrustStore rejects start from this and unset the
+// one property under test, rather than building an unrelated template from
+// scratch, so each failing case is a one-property mutation away from a
+// certificate that passes.
+func caTemplate(commonName string) x509.Certificate {
+	return x509.Certificate{
 		SerialNumber:          big.NewInt(1),
 		Subject:               pkix.Name{CommonName: commonName},
 		NotBefore:             time.Now().Add(-time.Hour),
@@ -38,6 +37,17 @@ func caCertPEM(t *testing.T, commonName string) []byte {
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
+	}
+}
+
+// certPEM self-signs template with a fresh ECDSA P-256 key and returns it
+// PEM encoded.
+func certPEM(t *testing.T, template x509.Certificate) []byte {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
@@ -48,99 +58,267 @@ func caCertPEM(t *testing.T, commonName string) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
-// writeCAFile writes a single self-signed CA certificate, CN "test-ca", to a
-// temporary PEM file and returns its path.
-func writeCAFile(t *testing.T) string {
+// caCertPEM generates a self-signed CA certificate that passes every
+// LoadTrustStore check, with the given common name, and returns it PEM
+// encoded.
+func caCertPEM(t *testing.T, commonName string) []byte {
+	t.Helper()
+	return certPEM(t, caTemplate(commonName))
+}
+
+// writeFile writes content to a file named name inside a fresh temporary
+// directory and returns its path.
+func writeFile(t *testing.T, name string, content []byte) string {
 	t.Helper()
 
-	path := filepath.Join(t.TempDir(), "ca.pem")
-	if err := os.WriteFile(path, caCertPEM(t, "test-ca"), 0o600); err != nil {
-		t.Fatalf("write ca file: %v", err)
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("write %s: %v", name, err)
 	}
 	return path
 }
 
-func TestLoadPool(t *testing.T) {
-	valid := writeCAFile(t)
-
-	notPEM := filepath.Join(t.TempDir(), "garbage.pem")
-	if err := os.WriteFile(notPEM, []byte("this is not a certificate"), 0o600); err != nil {
-		t.Fatalf("write garbage file: %v", err)
-	}
-
-	emptyPEM := filepath.Join(t.TempDir(), "empty.pem")
-	if err := os.WriteFile(emptyPEM, []byte("-----BEGIN OTHER-----\nAA==\n-----END OTHER-----\n"), 0o600); err != nil {
-		t.Fatalf("write empty pem: %v", err)
-	}
-
+func TestLoadTrustStore(t *testing.T) {
 	tests := map[string]struct {
-		path      string
-		wantError bool
+		path func(t *testing.T) string
+		// wantErr, if non-empty, is a substring the returned error must
+		// contain. An empty wantErr means LoadTrustStore must succeed.
+		wantErr string
+		// check, when set, inspects the successful result.
+		check func(t *testing.T, store *TrustStore)
 	}{
-		"valid CA file":               {path: valid, wantError: false},
-		"missing file":                {path: filepath.Join(t.TempDir(), "absent.pem"), wantError: true},
-		"file that is not PEM":        {path: notPEM, wantError: true},
-		"PEM without any certificate": {path: emptyPEM, wantError: true},
+		"valid CA": {
+			path: func(t *testing.T) string {
+				return writeFile(t, "ca.pem", caCertPEM(t, "test-ca"))
+			},
+			check: func(t *testing.T, store *TrustStore) {
+				want := []string{"CN=test-ca"}
+				if got := anchorSubjects(store); !slices.Equal(got, want) {
+					t.Errorf("subjects = %v, want %v", got, want)
+				}
+			},
+		},
+		"multiple valid CAs": {
+			path: func(t *testing.T) string {
+				var bundle []byte
+				for _, name := range []string{"first-ca", "second-ca", "third-ca"} {
+					bundle = append(bundle, caCertPEM(t, name)...)
+				}
+				return writeFile(t, "cas.pem", bundle)
+			},
+			check: func(t *testing.T, store *TrustStore) {
+				// Order matters: it is what makes a startup log naming the
+				// anchors a faithful description of the file, not a set that
+				// happens to contain the right elements.
+				want := []string{"CN=first-ca", "CN=second-ca", "CN=third-ca"}
+				if got := anchorSubjects(store); !slices.Equal(got, want) {
+					t.Errorf("subjects = %v, want %v", got, want)
+				}
+			},
+		},
+		// This is the demo.pem regression test: certs/demo.pem is a leaf
+		// certificate with BasicConstraintsValid true and IsCA false. Before
+		// this validation existed, Go's x509.CertPool accepted it as a
+		// trust anchor anyway, so anyone holding the committed
+		// certs/demo-key.pem could authenticate as a verified client.
+		"non-CA leaf with basic constraints": {
+			path: func(t *testing.T) string {
+				template := caTemplate("demo-leaf")
+				template.IsCA = false
+				return writeFile(t, "leaf.pem", certPEM(t, template))
+			},
+			wantErr: "not a CA",
+		},
+		"certificate with no basic constraints extension": {
+			path: func(t *testing.T) string {
+				template := caTemplate("no-basic-constraints")
+				template.BasicConstraintsValid = false
+				template.IsCA = false
+				return writeFile(t, "leaf.pem", certPEM(t, template))
+			},
+			wantErr: "not a CA",
+		},
+		"CA without KeyUsageCertSign": {
+			path: func(t *testing.T) string {
+				template := caTemplate("no-cert-sign")
+				template.KeyUsage = x509.KeyUsageDigitalSignature
+				return writeFile(t, "ca.pem", certPEM(t, template))
+			},
+			wantErr: "KeyUsageCertSign",
+		},
+		"expired CA": {
+			path: func(t *testing.T) string {
+				template := caTemplate("expired-ca")
+				template.NotBefore = time.Now().Add(-2 * time.Hour)
+				template.NotAfter = time.Now().Add(-time.Hour)
+				return writeFile(t, "ca.pem", certPEM(t, template))
+			},
+			wantErr: "expired",
+		},
+		"not-yet-valid CA": {
+			path: func(t *testing.T) string {
+				template := caTemplate("future-ca")
+				template.NotBefore = time.Now().Add(time.Hour)
+				template.NotAfter = time.Now().Add(2 * time.Hour)
+				return writeFile(t, "ca.pem", certPEM(t, template))
+			},
+			wantErr: "not yet valid",
+		},
+		"bundle mixing a valid CA with a malformed CERTIFICATE block": {
+			path: func(t *testing.T) string {
+				malformed := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("not a certificate")})
+				bundle := append(caCertPEM(t, "good-ca"), malformed...)
+				return writeFile(t, "bundle.pem", bundle)
+			},
+			// x509.CertPool.AppendCertsFromPEM would report success here
+			// because one block parsed; a trust store must not silently
+			// drop the corrupt CA and trust only the rest of the bundle.
+			wantErr: "parse certificate",
+		},
+		"bundle with a non-CERTIFICATE PEM block alongside a valid CA": {
+			path: func(t *testing.T) string {
+				comment := pem.EncodeToMemory(&pem.Block{Type: "COMMENT", Bytes: []byte("not a certificate")})
+				bundle := append(comment, caCertPEM(t, "good-ca")...)
+				return writeFile(t, "bundle.pem", bundle)
+			},
+			check: func(t *testing.T, store *TrustStore) {
+				want := []string{"CN=good-ca"}
+				if got := anchorSubjects(store); !slices.Equal(got, want) {
+					t.Errorf("subjects = %v, want %v", got, want)
+				}
+			},
+		},
+		"file that is not PEM at all": {
+			path: func(t *testing.T) string {
+				return writeFile(t, "garbage.pem", []byte("this is not a certificate"))
+			},
+			wantErr: "no PEM certificate",
+		},
+		"missing file": {
+			path: func(t *testing.T) string {
+				return filepath.Join(t.TempDir(), "absent.pem")
+			},
+			wantErr: "read client CA file",
+		},
 	}
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			pool, subjects, err := LoadPool(test.path)
+			path := test.path(t)
+			store, err := LoadTrustStore(path)
 
-			if test.wantError {
+			if test.wantErr != "" {
 				if err == nil {
-					t.Fatalf("LoadPool(%q) = nil error, want an error", test.path)
+					t.Fatalf("LoadTrustStore(%q) = nil error, want an error containing %q", path, test.wantErr)
 				}
-				if pool != nil {
-					t.Errorf("LoadPool returned a pool alongside an error; want nil")
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Errorf("LoadTrustStore(%q) error = %q, want it to contain %q", path, err, test.wantErr)
 				}
-				if subjects != nil {
-					t.Errorf("LoadPool returned subjects alongside an error; want nil")
+				if store != nil {
+					t.Errorf("LoadTrustStore returned a store alongside an error; want nil")
 				}
 				return
 			}
 
 			if err != nil {
-				t.Fatalf("LoadPool(%q) returned %v, want no error", test.path, err)
+				t.Fatalf("LoadTrustStore(%q) returned %v, want no error", path, err)
 			}
-			if pool == nil {
-				t.Fatal("LoadPool returned a nil pool without an error")
+			if store == nil {
+				t.Fatal("LoadTrustStore returned a nil store without an error")
 			}
-			if want := []string{"CN=test-ca"}; !slices.Equal(subjects, want) {
-				t.Errorf("subjects = %v, want %v", subjects, want)
+			if store.Pool() == nil {
+				t.Error("TrustStore.Pool() = nil, want a non-nil pool")
+			}
+			if test.check != nil {
+				test.check(t, store)
 			}
 		})
 	}
 }
 
-// TestLoadPool_Subjects proves the returned subjects are collected from the
-// CAs actually in the file, in order, rather than being some placeholder
-// that happens to satisfy TestLoadPool's single-CA case. This is what a
-// startup log naming "the subjects it will trust" depends on: a subject list
-// that doesn't reliably reflect the file's contents would be worse than no
-// list, since it would read as confirmation of the wrong thing.
-func TestLoadPool_Subjects(t *testing.T) {
-	var encoded []byte
-	for _, name := range []string{"first-ca", "second-ca"} {
-		encoded = append(encoded, caCertPEM(t, name)...)
+// anchorSubjects returns the subjects of store's anchors, in order.
+func anchorSubjects(store *TrustStore) []string {
+	var subjects []string
+	for _, anchor := range store.Anchors() {
+		subjects = append(subjects, anchor.Subject)
 	}
+	return subjects
+}
 
-	path := filepath.Join(t.TempDir(), "cas.pem")
-	if err := os.WriteFile(path, encoded, 0o600); err != nil {
-		t.Fatalf("write ca file: %v", err)
-	}
+// TestLoadTrustStore_Anchors proves each field of Anchor is populated from
+// the certificate actually in the file, not left zero-valued or copied from
+// the wrong source. The fingerprint is checked against an independently
+// computed digest so a bug that hashed the wrong bytes - the DER of a
+// different certificate, or the PEM block instead of the DER - would be
+// caught rather than passing because both sides used the same helper.
+func TestLoadTrustStore_Anchors(t *testing.T) {
+	template := caTemplate("known-ca")
+	template.SerialNumber = big.NewInt(987654321)
 
-	pool, subjects, err := LoadPool(path)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatalf("LoadPool(%q) returned %v, want no error", path, err)
+		t.Fatalf("generate key: %v", err)
 	}
-	if pool == nil {
-		t.Fatal("LoadPool returned a nil pool without an error")
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create certificate: %v", err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("parse certificate: %v", err)
 	}
 
-	want := []string{"CN=first-ca", "CN=second-ca"}
-	if !slices.Equal(subjects, want) {
-		t.Errorf("subjects = %v, want %v", subjects, want)
+	path := writeFile(t, "ca.pem", pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+
+	store, err := LoadTrustStore(path)
+	if err != nil {
+		t.Fatalf("LoadTrustStore(%q) returned %v, want no error", path, err)
+	}
+
+	anchors := store.Anchors()
+	if len(anchors) != 1 {
+		t.Fatalf("Anchors() returned %d anchors, want 1", len(anchors))
+	}
+	got := anchors[0]
+
+	if got.Subject != cert.Subject.String() {
+		t.Errorf("Subject = %q, want %q", got.Subject, cert.Subject.String())
+	}
+	if got.Issuer != cert.Issuer.String() {
+		t.Errorf("Issuer = %q, want %q", got.Issuer, cert.Issuer.String())
+	}
+	if got.Serial != cert.SerialNumber.String() {
+		t.Errorf("Serial = %q, want %q", got.Serial, cert.SerialNumber.String())
+	}
+	wantFingerprint := sha256.Sum256(cert.Raw)
+	if got.FingerprintSHA256 != hex.EncodeToString(wantFingerprint[:]) {
+		t.Errorf("FingerprintSHA256 = %q, want %q", got.FingerprintSHA256, hex.EncodeToString(wantFingerprint[:]))
+	}
+	if !got.NotBefore.Equal(cert.NotBefore) {
+		t.Errorf("NotBefore = %v, want %v", got.NotBefore, cert.NotBefore)
+	}
+	if !got.NotAfter.Equal(cert.NotAfter) {
+		t.Errorf("NotAfter = %v, want %v", got.NotAfter, cert.NotAfter)
+	}
+}
+
+// TestLoadTrustStore_AnchorsIndependentOfPool proves Anchors returns a copy:
+// mutating the slice returned by one call must not be visible through a
+// second call, since the TrustStore is meant to be handed to a listener and
+// read from concurrently.
+func TestLoadTrustStore_AnchorsIndependentOfPool(t *testing.T) {
+	path := writeFile(t, "ca.pem", caCertPEM(t, "test-ca"))
+	store, err := LoadTrustStore(path)
+	if err != nil {
+		t.Fatalf("LoadTrustStore(%q) returned %v, want no error", path, err)
+	}
+
+	first := store.Anchors()
+	first[0].Subject = "tampered"
+
+	second := store.Anchors()
+	if second[0].Subject == "tampered" {
+		t.Error("Anchors() returned a slice aliasing internal state; mutation leaked across calls")
 	}
 }
 

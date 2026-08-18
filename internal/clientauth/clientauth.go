@@ -13,36 +13,86 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
 	"time"
 )
 
-// LoadPool reads a PEM file of client CA certificates and returns a pool that
-// client certificates are verified against, together with the subject of
-// every CA it contains.
+// TrustStore is a validated set of client CA trust anchors: every
+// certificate it holds passed the checks in LoadTrustStore, so the pool it
+// exposes can be handed to tls.Config.ClientCAs without a caller having to
+// re-verify what's in it.
+type TrustStore struct {
+	pool    *x509.CertPool
+	anchors []Anchor
+}
+
+// Pool returns the trust anchors as an x509 pool for use as
+// tls.Config.ClientCAs. Never nil: LoadTrustStore fails rather than
+// producing a TrustStore with an empty pool.
+func (t *TrustStore) Pool() *x509.CertPool {
+	return t.pool
+}
+
+// Anchors describes each trusted CA, in the order it appeared in the source
+// file, for startup logging and diagnostics.
+func (t *TrustStore) Anchors() []Anchor {
+	return slices.Clone(t.anchors)
+}
+
+// Anchor describes one trusted CA.
 //
-// The subjects are collected here, rather than derived from the pool
-// afterwards, so a startup log naming them costs nothing extra: LoadPool
-// accepts any PEM containing at least one certificate, so pointing it at the
-// wrong file - an old CA, a server certificate, a bundle missing one CA -
-// starts cleanly and only fails, silently, the first time a legitimate
-// client is rejected. Logging the trusted subjects at startup is what lets
-// an operator catch that before it does.
+// Subject alone does not identify a CA across rotation: a replacement CA is
+// commonly issued with the same subject DN as the one it replaces, so a log
+// line naming only the subject cannot tell an operator which CA is actually
+// live. FingerprintSHA256 can.
+type Anchor struct {
+	Subject           string
+	Issuer            string
+	Serial            string
+	FingerprintSHA256 string
+	NotBefore         time.Time
+	NotAfter          time.Time
+}
+
+// LoadTrustStore reads and validates a PEM file of client CA certificates.
+//
+// Every CERTIFICATE block must be a CA: BasicConstraintsValid, IsCA, and
+// KeyUsageCertSign are all required, so a leaf certificate - which is
+// exactly the shape of a committed demo certificate that operators are
+// warned not to trust - cannot be pointed at this file and accepted as an
+// issuer. Rejecting an unvalidated basic-constraints extension the same way
+// a CA that explicitly disclaims itself does: a certificate that does not
+// assert it is a CA must not be trusted as one.
+//
+// An expired or not-yet-valid anchor is also rejected here, even though
+// crypto/tls independently refuses an expired anchor at handshake time. That
+// stdlib check fails silently and per-connection; validating at load time
+// turns the same condition into a loud, named failure at startup instead of
+// a mystery the first time a legitimate client is rejected.
+//
+// A block that is not a CERTIFICATE, such as a comment or another PEM type,
+// is skipped: a bundle may legitimately carry other content alongside the
+// certificates. A block that claims to be a CERTIFICATE but fails to parse
+// is not skipped - x509.CertPool.AppendCertsFromPEM treats that as success
+// if any other block in the file parsed, which means a corrupt CA can sit
+// beside a valid one in a bundle and be silently dropped rather than fixed.
+// For a trust store, partial success is the wrong default.
 //
 // A file that yields no certificate is an error rather than an empty pool.
 // An empty pool would fail every client certificate presented to it, which is
 // an operator mistake and not a configuration anyone intends.
-func LoadPool(path string) (*x509.CertPool, []string, error) {
+func LoadTrustStore(path string) (*TrustStore, error) {
 	// #nosec G304 -- the path is operator-supplied configuration; reading it is the point
 	encoded, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("clientauth: read client CA file: %w", err)
+		return nil, fmt.Errorf("clientauth: read client CA file: %w", err)
 	}
 
 	pool := x509.NewCertPool()
-	var subjects []string
+	var anchors []Anchor
 
 	rest := encoded
 	for {
@@ -56,20 +106,48 @@ func LoadPool(path string) (*x509.CertPool, []string, error) {
 		}
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
-			// Matches x509.CertPool.AppendCertsFromPEM: a block that claims to
-			// be a certificate but does not parse as one is skipped rather
-			// than failing the whole file.
-			continue
+			return nil, fmt.Errorf("clientauth: %s: parse certificate: %w", path, err)
 		}
+		if err := validateAnchor(cert); err != nil {
+			return nil, fmt.Errorf("clientauth: %s: %s: %w", path, cert.Subject, err)
+		}
+
 		pool.AddCert(cert)
-		subjects = append(subjects, cert.Subject.String())
+		fingerprint := sha256.Sum256(cert.Raw)
+		anchors = append(anchors, Anchor{
+			Subject:           cert.Subject.String(),
+			Issuer:            cert.Issuer.String(),
+			Serial:            cert.SerialNumber.String(),
+			FingerprintSHA256: hex.EncodeToString(fingerprint[:]),
+			NotBefore:         cert.NotBefore,
+			NotAfter:          cert.NotAfter,
+		})
 	}
 
-	if len(subjects) == 0 {
-		return nil, nil, fmt.Errorf("clientauth: %s contains no PEM certificate", path)
+	if len(anchors) == 0 {
+		return nil, fmt.Errorf("clientauth: %s contains no PEM certificate", path)
 	}
 
-	return pool, subjects, nil
+	return &TrustStore{pool: pool, anchors: anchors}, nil
+}
+
+// validateAnchor reports why cert cannot be trusted as a client CA, or nil
+// if it can.
+func validateAnchor(cert *x509.Certificate) error {
+	if !cert.BasicConstraintsValid || !cert.IsCA {
+		return errors.New("not a CA certificate")
+	}
+	if cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return errors.New("missing KeyUsageCertSign")
+	}
+	now := time.Now()
+	if now.Before(cert.NotBefore) {
+		return fmt.Errorf("not yet valid (not before %s)", cert.NotBefore)
+	}
+	if now.After(cert.NotAfter) {
+		return fmt.Errorf("expired (not after %s)", cert.NotAfter)
+	}
+	return nil
 }
 
 // Identity describes a client certificate that the server verified.
