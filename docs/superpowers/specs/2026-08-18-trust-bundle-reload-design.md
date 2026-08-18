@@ -1,8 +1,9 @@
 # Reloading the client CA trust bundle
 
 Date: 2026-08-18
-Status: proposed, awaiting review
-Branch: `mtls-trust-reload`, stacked on `mtls-client-auth` (PR #9)
+Status: approved, not yet implemented
+Branch: `mtls-trust-reload`, now branched from `main` — PR #9 merged as
+`d87a73c` and released as v3.1.0, so this is no longer stacked work.
 
 ## Purpose
 
@@ -39,7 +40,7 @@ publicly-issued client certificate.** Anyone holding a certificate from a
 public CA would be reported by `/whoami` as a verified identity.
 
 Today this is unreachable: `ClientAuth` is only set when a pool exists
-(`internal/server/server.go`), and `LoadPool` fails startup rather than
+(`internal/server/server.go`), and `LoadTrustStore` fails startup rather than
 returning an empty pool. Adding reload creates the path. It is the mistake a
 careless reconcile writes, and it fails open rather than closed.
 
@@ -189,19 +190,30 @@ should fail the process, not be logged and ignored.
 
 ### `/status.json` reports the trust bundle
 
-A new `trust_bundle` block reports the CA subjects, when the bundle was last
-loaded, and its staleness:
+A new `trust_bundle` block reports the trusted anchors, when the bundle was
+last loaded, and its staleness:
 
 ```json
 "trust_bundle": {
   "file_path": "/tls/client-ca.pem",
-  "subjects": ["CN=goweb-client-ca"],
+  "anchors": [
+    {
+      "subject": "CN=goweb-client-ca",
+      "fingerprint_sha256": "5704a5b2…",
+      "not_after": "2036-08-15T09:50:28Z"
+    }
+  ],
   "loaded_at": "2026-08-18T05:00:00Z",
   "last_success": "2026-08-18T05:04:00Z",
   "stale_seconds": 0,
   "last_error": ""
 }
 ```
+
+Anchors carry fingerprints, not just subjects. A rotation that replaces a CA
+commonly preserves the subject DN, so a suite asserting that a rotation
+landed cannot tell the new CA from the old one by subject alone — which
+would make this block useless for the one job it exists to do.
 
 The block is **absent** when client-certificate verification is disabled,
 matching how `certificate` is null rather than an empty object when no
@@ -273,17 +285,19 @@ error wrapping of `ErrWatcherClosed`, and its log output are unchanged —
 // rotates.
 type Bundle struct { /* ... */ }
 
-// NewBundle loads path once and returns a Bundle ready to watch it.
-// A file that cannot be read, or that yields no certificate, is an error:
-// startup must not proceed with a trust store that trusts nothing, and -
-// see the security constraint above - must never proceed with a nil pool.
+// NewBundle loads path once, through LoadTrustStore, and returns a Bundle
+// ready to watch it. Every failure LoadTrustStore reports is a startup
+// failure: a trust store that trusts nothing, or one holding an anchor that
+// is not a usable CA, is an operator mistake - and per the security
+// constraint above, a nil pool is not a safe fallback but the widest
+// possible one.
 func NewBundle(path string, opts ...BundleOption) (*Bundle, error)
 
 // Pool returns the currently published trust pool. It is never nil.
 func (b *Bundle) Pool() *x509.CertPool
 
-// Subjects returns the subjects of the currently trusted CAs.
-func (b *Bundle) Subjects() []string
+// Anchors describes the currently trusted CAs.
+func (b *Bundle) Anchors() []Anchor
 
 // Status describes the bundle for /status.json.
 func (b *Bundle) Status() BundleStatus
@@ -300,8 +314,18 @@ func (b *Bundle) Watch(ctx context.Context) error
 func (b *Bundle) OnChange(fn func(*x509.CertPool))
 ```
 
-`LoadPool` keeps its current signature and becomes `NewBundle`'s
-one-shot loader, so the parsing and subject-collection logic has one home.
+`LoadTrustStore` — which landed in the PR #9 review round, replacing the
+original `LoadPool` — keeps its signature and becomes the one-shot loader
+behind both `NewBundle` and `Reconcile`, so parsing, validation and anchor
+metadata have exactly one home. `Bundle` wraps a `*TrustStore` rather than
+reimplementing any part of it, and `Anchor` is that package's existing type.
+
+This matters more than tidiness. `LoadTrustStore` rejects anchors that are
+not usable CAs, and rejects a bundle whose armour marker count exceeds the
+blocks that actually decoded. Reload gets both checks for free, which means
+a rotation that lands a corrupt or non-CA bundle is refused and the previous
+pool is retained — invariant 1, enforced by the loader rather than by
+reload-specific code that could drift from it.
 
 ### `internal/server`
 
@@ -331,7 +355,7 @@ above.
 
 ### `cmd/goweb-https`
 
-`run` builds the `Bundle` instead of calling `LoadPool` directly, registers
+`run` builds the `Bundle` instead of calling `LoadTrustStore` directly, registers
 the server's rebuild callback, passes the bundle as both the initial pool
 and the status provider, and adds `bundle.Watch` to `runComponents`
 alongside `srv.Run` and `reloader.Watch`.
@@ -362,7 +386,7 @@ alongside `srv.Run` and `reloader.Watch`.
   serving certificate still does. Both asserted, so the asymmetry is
   deliberate and pinned.
 - **`/status.json`** — the `trust_bundle` block appears with the right
-  subjects when verification is on, and is absent when it is off.
+  anchors when verification is on, and is absent when it is off.
 
 ## Out of scope
 
