@@ -442,10 +442,12 @@ func testCertificate(t *testing.T) (*tls.Certificate, *x509.CertPool) {
 // errNotReady is a stand-in readiness failure used across the status tests.
 var errNotReady = errors.New("no certificate available")
 
-// TestProbesWorkWithoutClientCertificate proves that configuring a trust
-// store does not stop a client that presents no certificate at all - this is
-// the test that would have caught RequireAndVerifyClientCert.
-func TestProbesWorkWithoutClientCertificate(t *testing.T) {
+// TestClientAuthConfiguredOnTLSConfig proves that configuring a client CA
+// pool turns on optional client verification on the listener's tls.Config -
+// GetCertificate, MinVersion, ClientAuth and ClientCAs all land as New
+// intends. It does not perform a handshake; TestProbesWorkWithoutClientCertificate
+// below is the end-to-end proof that probes still succeed.
+func TestClientAuthConfiguredOnTLSConfig(t *testing.T) {
 	t.Parallel()
 
 	cert, _ := testCertificate(t)
@@ -479,6 +481,36 @@ func TestProbesWorkWithoutClientCertificate(t *testing.T) {
 	}
 	if srv.http.TLSConfig.GetCertificate == nil {
 		t.Error("GetCertificate is nil; server authentication would be broken")
+	}
+}
+
+// TestProbesWorkWithoutClientCertificate is the end-to-end proof for the
+// central risk of this feature: that turning on mTLS silently stops
+// Kubernetes probes and the pod never becomes ready. It performs a real
+// handshake against a real listener with a client CA pool configured, and
+// the client presents no certificate at all - both /livez and /readyz must
+// still answer 200.
+func TestProbesWorkWithoutClientCertificate(t *testing.T) {
+	t.Parallel()
+
+	serverCert, roots := testCertificate(t)
+	clientCAs, _ := testClientCertificate(t)
+
+	srv := newTestServer(t, serverCert, clientCAs)
+	client := tlsClient(roots, nil)
+
+	for _, path := range []string{"/livez", "/readyz"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := client.Get(srv.URL + path)
+			if err != nil {
+				t.Fatalf("GET %s returned %v, want no error", path, err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+		})
 	}
 }
 

@@ -130,6 +130,11 @@ func routes(deps Dependencies) http.Handler {
 	// property of the endpoint, identical in every deployment, instead of
 	// something a scraper has to know the pod's configuration to predict.
 	mux.HandleFunc("GET /status.json", handleStatusJSON(deps))
+	// The client identity the handshake proved. A separate path from /status
+	// because it answers a different question and, unlike /status, refuses
+	// callers it cannot identify.
+	mux.HandleFunc("GET /whoami", handleWhoami(deps))
+	mux.HandleFunc("GET /whoami.json", handleWhoamiJSON(deps))
 	mux.HandleFunc("GET /livez", handleLive())
 	mux.HandleFunc("GET /readyz", handleReady(deps))
 	return mux
