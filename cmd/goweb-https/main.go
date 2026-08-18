@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"log/slog"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RafPe/goweb-https/internal/certreload"
+	"github.com/RafPe/goweb-https/internal/clientauth"
 	"github.com/RafPe/goweb-https/internal/config"
 	"github.com/RafPe/goweb-https/internal/server"
 )
@@ -35,6 +37,17 @@ func run(ctx context.Context) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+
+	// The trust store is loaded once. It changes on a different timescale
+	// from the served certificate, and a restart is an acceptable way to
+	// pick up a new one.
+	var clientCAs *x509.CertPool
+	if cfg.ClientCAFile != "" {
+		clientCAs, err = clientauth.LoadPool(cfg.ClientCAFile)
+		if err != nil {
+			return err
+		}
 	}
 
 	reloader, err := certreload.New(cfg.CertificateFile, cfg.KeyFile,
@@ -63,6 +76,7 @@ func run(ctx context.Context) error {
 		PodName:      cfg.PodName,
 		PodNamespace: cfg.PodNamespace,
 		StartedAt:    time.Now(),
+		ClientCAs:    clientCAs,
 	})
 	if err != nil {
 		return err
@@ -85,6 +99,8 @@ func run(ctx context.Context) error {
 		"address", cfg.Address,
 		"reload_interval", cfg.ReloadInterval,
 		"shutdown_timeout", cfg.ShutdownTimeout,
+		"client_certificate_verification", cfg.ClientCAFile != "",
+		"client_ca_file", cfg.ClientCAFile,
 	)
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
