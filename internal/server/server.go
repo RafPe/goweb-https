@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,6 +41,11 @@ type Dependencies struct {
 	Hostname     string
 	PodName      string
 	PodNamespace string
+
+	// ClientCAs is the trust store that client certificates are verified
+	// against. When nil, no client certificate is requested and the routes
+	// that need one always refuse.
+	ClientCAs *x509.CertPool
 
 	// StartedAt is when serving began, which is what uptime should measure -
 	// not when the process happened to initialise its packages.
@@ -82,16 +88,26 @@ func New(addr string, shutdownTimeout time.Duration, getCertificate func(*tls.Cl
 		return nil, errors.New("server: shutdown timeout must be positive")
 	}
 
+	// Client certificates are optional at the listener and required only by
+	// the routes that ask for one. Requiring them here would stop /livez and
+	// /readyz working, because probes present no certificate - the pod would
+	// never become ready.
+	tlsConfig := &tls.Config{
+		GetCertificate: getCertificate,
+		MinVersion:     tls.VersionTLS13,
+	}
+	if deps.ClientCAs != nil {
+		tlsConfig.ClientAuth = tls.VerifyClientCertIfGiven
+		tlsConfig.ClientCAs = deps.ClientCAs
+	}
+
 	return &Server{
 		logger:          deps.Logger,
 		shutdownTimeout: shutdownTimeout,
 		http: &http.Server{
-			Addr:    addr,
-			Handler: routes(deps),
-			TLSConfig: &tls.Config{
-				GetCertificate: getCertificate,
-				MinVersion:     tls.VersionTLS13,
-			},
+			Addr:              addr,
+			Handler:           routes(deps),
+			TLSConfig:         tlsConfig,
 			ReadHeaderTimeout: readHeaderTimeout,
 			ReadTimeout:       readTimeout,
 			WriteTimeout:      writeTimeout,

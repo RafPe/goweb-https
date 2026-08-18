@@ -441,3 +441,65 @@ func testCertificate(t *testing.T) (*tls.Certificate, *x509.CertPool) {
 
 // errNotReady is a stand-in readiness failure used across the status tests.
 var errNotReady = errors.New("no certificate available")
+
+// TestProbesWorkWithoutClientCertificate proves that configuring a trust
+// store does not stop a client that presents no certificate at all - this is
+// the test that would have caught RequireAndVerifyClientCert.
+func TestProbesWorkWithoutClientCertificate(t *testing.T) {
+	t.Parallel()
+
+	cert, _ := testCertificate(t)
+
+	// A trust store that will never match: the point is that configuring one
+	// must not stop a client that presents no certificate at all.
+	clientCAs := x509.NewCertPool()
+	clientCAs.AddCert(cert.Leaf)
+
+	deps := testDeps(healthyProvider())
+	deps.ClientCAs = clientCAs
+
+	srv, err := New(
+		"127.0.0.1:0",
+		time.Second,
+		func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil },
+		deps,
+	)
+	if err != nil {
+		t.Fatalf("New returned %v, want no error", err)
+	}
+
+	if got := srv.http.TLSConfig.ClientAuth; got != tls.VerifyClientCertIfGiven {
+		t.Errorf("ClientAuth = %v, want tls.VerifyClientCertIfGiven", got)
+	}
+	if srv.http.TLSConfig.ClientCAs == nil {
+		t.Error("ClientCAs is nil, want the configured pool")
+	}
+	if got := srv.http.TLSConfig.MinVersion; got != tls.VersionTLS13 {
+		t.Errorf("MinVersion = %v, want TLS 1.3", got)
+	}
+	if srv.http.TLSConfig.GetCertificate == nil {
+		t.Error("GetCertificate is nil; server authentication would be broken")
+	}
+}
+
+// TestClientAuthDisabledByDefault proves existing behaviour is unaffected
+// when no trust store is configured.
+func TestClientAuthDisabledByDefault(t *testing.T) {
+	t.Parallel()
+
+	cert, _ := testCertificate(t)
+
+	srv, err := New(
+		"127.0.0.1:0",
+		time.Second,
+		func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil },
+		testDeps(healthyProvider()),
+	)
+	if err != nil {
+		t.Fatalf("New returned %v, want no error", err)
+	}
+
+	if got := srv.http.TLSConfig.ClientAuth; got != tls.NoClientCert {
+		t.Errorf("ClientAuth = %v, want tls.NoClientCert when no pool is configured", got)
+	}
+}
