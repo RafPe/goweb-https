@@ -496,7 +496,7 @@ func TestProbesWorkWithoutClientCertificate(t *testing.T) {
 	serverCert, roots := testCertificate(t)
 	clientCAs, _ := testClientCertificate(t)
 
-	srv := newTestServer(t, serverCert, clientCAs)
+	srv := newTestServer(t, serverCert, roots, clientCAs)
 	client := tlsClient(roots, nil)
 
 	for _, path := range []string{"/livez", "/readyz"} {

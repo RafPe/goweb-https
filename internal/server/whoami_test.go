@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -12,7 +13,6 @@ import (
 	"io"
 	"math/big"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -23,7 +23,7 @@ func TestWhoami(t *testing.T) {
 	clientCAs, trustedClient := testClientCertificate(t)
 	_, untrustedClient := testClientCertificate(t)
 
-	srv := newTestServer(t, serverCert, clientCAs)
+	srv := newTestServer(t, serverCert, roots, clientCAs)
 
 	t.Run("trusted client certificate is reported", func(t *testing.T) {
 		client := tlsClient(roots, trustedClient)
@@ -97,7 +97,7 @@ func TestWhoami(t *testing.T) {
 
 func TestWhoamiWithoutTrustStore(t *testing.T) {
 	serverCert, roots := testCertificate(t)
-	srv := newTestServer(t, serverCert, nil)
+	srv := newTestServer(t, serverCert, roots, nil)
 
 	client := tlsClient(roots, nil)
 	resp, err := client.Get(srv.URL + "/whoami")
@@ -185,36 +185,51 @@ func testClientCertificate(t *testing.T) (*x509.CertPool, *tls.Certificate) {
 	}
 }
 
-// newTestServer starts a real TLS listener serving routes(deps), configured
-// with the same client-auth policy New applies - the only way to prove the
-// client-certificate wiring works end to end.
-//
-// serverCert is set on Certificates rather than GetCertificate. Production
-// uses GetCertificate because tls.Config prefers it whenever the client sends
-// SNI, but this test dials a loopback IP literal, which never carries SNI -
-// crypto/tls would then fall through to Certificates, and httptest.StartTLS
-// additionally replaces an empty Certificates slice with its own throwaway
-// cert, serving neither our certificate nor triggering the callback. Setting
-// Certificates directly sidesteps both.
-func newTestServer(t *testing.T, serverCert *tls.Certificate, clientCAs *x509.CertPool) *httptest.Server {
+// testServer is the minimal handle callers need from newTestServer.
+type testServer struct {
+	URL string
+}
+
+// newTestServer starts a real listener through New() itself, the same
+// constructor production uses, rather than a hand-rolled tls.Config that
+// copies New's policy. A hand-rolled copy can drift from what New actually
+// does and silently stop guarding the risk these tests exist for - e.g. it
+// would keep passing even if New started requiring client certificates,
+// because the copy, not New, is what decided ClientAuth. Going through New
+// means these tests fail the moment New's behaviour changes.
+func newTestServer(t *testing.T, serverCert *tls.Certificate, roots *x509.CertPool, clientCAs *x509.CertPool) *testServer {
 	t.Helper()
 
 	deps := testDeps(healthyProvider())
 	deps.ClientCAs = clientCAs
 
-	srv := httptest.NewUnstartedServer(routes(deps))
-	srv.TLS = &tls.Config{
-		Certificates: []tls.Certificate{*serverCert},
-		MinVersion:   tls.VersionTLS13,
+	srv, err := New(reserveLocalAddr(t), 5*time.Second,
+		func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return serverCert, nil },
+		deps)
+	if err != nil {
+		t.Fatalf("New: %v", err)
 	}
-	if clientCAs != nil {
-		srv.TLS.ClientAuth = tls.VerifyClientCertIfGiven
-		srv.TLS.ClientCAs = clientCAs
-	}
-	srv.StartTLS()
-	t.Cleanup(srv.Close)
 
-	return srv
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- srv.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		if err := <-done; err != nil {
+			t.Errorf("Run returned %v, want nil on shutdown", err)
+		}
+	})
+
+	url := "https://" + srv.http.Addr
+
+	// The readiness probe never presents a client certificate: whether the
+	// listener accepts that is exactly what these tests are here to check,
+	// so the probe must not beg the question by trusting clientCAs is unset.
+	if err := waitForOK(tlsClient(roots, nil), url+"/livez", 5*time.Second); err != nil {
+		t.Fatalf("server did not become reachable: %v", err)
+	}
+
+	return &testServer{URL: url}
 }
 
 // tlsClient builds an http.Client that trusts roots and, when cert is
