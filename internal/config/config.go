@@ -64,6 +64,11 @@ type Config struct {
 	// the diagnostic endpoint.
 	PodName      string
 	PodNamespace string
+
+	// ClientCAFile is the PEM file of client CA certificates that client
+	// certificates are verified against. Empty means client-certificate
+	// verification is disabled and the server requests no certificate.
+	ClientCAFile string
 }
 
 // LookupFunc resolves an environment variable. It matches os.LookupEnv so that
@@ -121,6 +126,11 @@ func LoadFrom(lookup LookupFunc) (Config, error) {
 		errs = append(errs, err)
 	}
 
+	clientCAFile, err := clientCAPath(lookup)
+	if err != nil {
+		errs = append(errs, err)
+	}
+
 	if err := errors.Join(errs...); err != nil {
 		return Config{}, err
 	}
@@ -137,6 +147,7 @@ func LoadFrom(lookup LookupFunc) (Config, error) {
 		AllowExpiredCertificate: allowExpired,
 		PodName:                 stringVar(lookup, "POD_NAME", ""),
 		PodNamespace:            stringVar(lookup, "POD_NAMESPACE", ""),
+		ClientCAFile:            clientCAFile,
 	}, nil
 }
 
@@ -170,6 +181,23 @@ func certificatePaths(lookup LookupFunc) (certFile, keyFile string, err error) {
 	}
 
 	return cert, key, nil
+}
+
+// clientCAPath resolves the client CA trust store location.
+//
+// The variable being set is what enables client-certificate verification.
+// There is no separate boolean, because a second variable that can disagree
+// with this one is a way to be misconfigured rather than a feature. Set but
+// empty is an operator mistake, matching certificatePaths.
+func clientCAPath(lookup LookupFunc) (string, error) {
+	value, ok := lookup("GOWEB_MTLS_CLIENT_CA")
+	if !ok {
+		return "", nil
+	}
+	if value == "" {
+		return "", errors.New("GOWEB_MTLS_CLIENT_CA: must not be empty when set")
+	}
+	return value, nil
 }
 
 // timezone resolves the display timezone. An explicitly configured but

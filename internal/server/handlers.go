@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/RafPe/goweb-https/internal/clientauth"
 )
 
 // expiryWarningThreshold is how close to expiry a certificate must be before
@@ -14,6 +16,13 @@ const expiryWarningThreshold = 30 * time.Minute
 // handleRoot serves the human-facing landing page.
 func handleRoot(deps Dependencies) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Set unconditionally, before anything is written: the response
+		// varies by client certificate, which a cache cannot see and so
+		// cannot key on, and this page prints the current time on every
+		// request regardless, so it was never usefully cacheable anyway.
+		// See noStore.
+		noStore(w)
+
 		var b strings.Builder
 
 		fmt.Fprintf(&b, "Hello there! I am serving this content via https :) \n")
@@ -21,14 +30,22 @@ func handleRoot(deps Dependencies) http.HandlerFunc {
 		fmt.Fprintf(&b, "⏰ Time: %s\n", formatTime(deps.Now(), deps.Location))
 		fmt.Fprintf(&b, "🌐 Client IP: %s\n", r.RemoteAddr)
 
-		if state := r.TLS; state != nil && len(state.PeerCertificates) > 0 {
-			peer := state.PeerCertificates[0]
-			fmt.Fprintf(&b, "🔐 SNI: %s\n", state.ServerName)
-			fmt.Fprintf(&b, "📜 Certificate CN: %s\n", peer.Subject.CommonName)
-			fmt.Fprintf(&b, "🏷️ Certificate SANs: %v\n", peer.DNSNames)
-			fmt.Fprintf(&b, "⏳ Certificate Valid: %s to %s\n",
-				formatTime(peer.NotBefore, deps.Location),
-				formatTime(peer.NotAfter, deps.Location))
+		// SNI is a property of every TLS request, not only of requests that
+		// carry a client certificate - it used to be printed inside the
+		// certificate branch, where it never appeared at all.
+		if r.TLS != nil {
+			fmt.Fprintf(&b, "🔐 SNI: %s\n", r.TLS.ServerName)
+		}
+
+		// Read through clientauth so that one place in the codebase decides
+		// what "the verified client" means, and so this stays correct if the
+		// listener's ClientAuth setting ever changes.
+		if identity, ok := clientauth.IdentityFrom(r.TLS); ok {
+			fmt.Fprintf(&b, "📜 Client Certificate Subject: %s\n", identity.Subject)
+			fmt.Fprintf(&b, "🏷️ Client Certificate SANs: %v\n", identity.DNSNames)
+			fmt.Fprintf(&b, "⏳ Client Certificate Valid: %s to %s\n",
+				formatTime(identity.NotBefore, deps.Location),
+				formatTime(identity.NotAfter, deps.Location))
 		}
 
 		writeText(w, http.StatusOK, b.String())
@@ -43,6 +60,12 @@ func handleRoot(deps Dependencies) http.HandlerFunc {
 func handleStatus(deps Dependencies) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		report := buildStatus(deps, r)
+
+		// The representation depends on Accept - see prefersJSON - so a cache
+		// or proxy sitting in front of this endpoint must not serve the JSON
+		// body to a client that asked for the human page, or vice versa.
+		// /status.json has exactly one representation and does not need this.
+		w.Header().Set("Vary", "Accept")
 
 		// A client that explicitly asked for JSON gets JSON from this path too,
 		// so a scraper that cannot be pointed at a different URL still has a
@@ -177,6 +200,27 @@ func formatTime(t time.Time, location *time.Location) string {
 		return utc
 	}
 	return fmt.Sprintf("%s (%s)", local, utc)
+}
+
+// noStore marks the response as never cacheable.
+//
+// It guards against a specific replay: a response that carries one client's
+// verified identity is keyed only by URL, not by which client asked for it,
+// so a cache sitting in front of the server could store one client's
+// identity and serve it back to a different client that later requests the
+// same path. Certificate-bearing responses make this worse than the usual
+// per-user cache leak - the response varies by client certificate, which is
+// not a request header, so no Vary value exists that could describe the
+// variation to a cache; no-store is the only policy a cache can be told.
+//
+// Call it explicitly from every handler whose response is shaped by the
+// caller's verified identity - currently / and /whoami - rather than folding
+// it into writeText or writeJSON: diagnostic endpoints like /status carry no
+// per-client information and must not send it, and a shared writer would
+// make that exclusion something a future handler has to remember to opt out
+// of instead of something it has to deliberately opt into.
+func noStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
 }
 
 // writeText sends a complete plain-text response.

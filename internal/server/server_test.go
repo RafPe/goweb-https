@@ -87,9 +87,15 @@ func TestRoutes(t *testing.T) {
 		target     string
 		wantStatus int
 	}{
-		"root":                {method: http.MethodGet, target: "/", wantStatus: http.StatusOK},
-		"status":              {method: http.MethodGet, target: "/status", wantStatus: http.StatusOK},
-		"status json":         {method: http.MethodGet, target: "/status.json", wantStatus: http.StatusOK},
+		"root":        {method: http.MethodGet, target: "/", wantStatus: http.StatusOK},
+		"status":      {method: http.MethodGet, target: "/status", wantStatus: http.StatusOK},
+		"status json": {method: http.MethodGet, target: "/status.json", wantStatus: http.StatusOK},
+		// No TLS on a request built by httptest.NewRequest, so these refuse -
+		// the same "no certificate" path TestWhoamiJSON_RefusalIsExplicit
+		// covers in detail. Listed here for the same reason every other route
+		// is: routing itself is method-scoped and reachable.
+		"whoami":              {method: http.MethodGet, target: "/whoami", wantStatus: http.StatusForbidden},
+		"whoami json":         {method: http.MethodGet, target: "/whoami.json", wantStatus: http.StatusForbidden},
 		"livez":               {method: http.MethodGet, target: "/livez", wantStatus: http.StatusOK},
 		"readyz":              {method: http.MethodGet, target: "/readyz", wantStatus: http.StatusOK},
 		"unknown path":        {method: http.MethodGet, target: "/nope", wantStatus: http.StatusNotFound},
@@ -441,3 +447,97 @@ func testCertificate(t *testing.T) (*tls.Certificate, *x509.CertPool) {
 
 // errNotReady is a stand-in readiness failure used across the status tests.
 var errNotReady = errors.New("no certificate available")
+
+// TestClientAuthConfiguredOnTLSConfig proves that configuring a client CA
+// pool turns on optional client verification on the listener's tls.Config -
+// GetCertificate, MinVersion, ClientAuth and ClientCAs all land as New
+// intends. It does not perform a handshake; TestProbesWorkWithoutClientCertificate
+// below is the end-to-end proof that probes still succeed.
+func TestClientAuthConfiguredOnTLSConfig(t *testing.T) {
+	t.Parallel()
+
+	cert, _ := testCertificate(t)
+
+	// A trust store that will never match: the point is that configuring one
+	// must not stop a client that presents no certificate at all.
+	clientCAs := x509.NewCertPool()
+	clientCAs.AddCert(cert.Leaf)
+
+	deps := testDeps(healthyProvider())
+	deps.ClientCAs = clientCAs
+
+	srv, err := New(
+		"127.0.0.1:0",
+		time.Second,
+		func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil },
+		deps,
+	)
+	if err != nil {
+		t.Fatalf("New returned %v, want no error", err)
+	}
+
+	if got := srv.http.TLSConfig.ClientAuth; got != tls.VerifyClientCertIfGiven {
+		t.Errorf("ClientAuth = %v, want tls.VerifyClientCertIfGiven", got)
+	}
+	if srv.http.TLSConfig.ClientCAs == nil {
+		t.Error("ClientCAs is nil, want the configured pool")
+	}
+	if got := srv.http.TLSConfig.MinVersion; got != tls.VersionTLS13 {
+		t.Errorf("MinVersion = %v, want TLS 1.3", got)
+	}
+	if srv.http.TLSConfig.GetCertificate == nil {
+		t.Error("GetCertificate is nil; server authentication would be broken")
+	}
+}
+
+// TestProbesWorkWithoutClientCertificate is the end-to-end proof for the
+// central risk of this feature: that turning on mTLS silently stops
+// Kubernetes probes and the pod never becomes ready. It performs a real
+// handshake against a real listener with a client CA pool configured, and
+// the client presents no certificate at all - both /livez and /readyz must
+// still answer 200.
+func TestProbesWorkWithoutClientCertificate(t *testing.T) {
+	t.Parallel()
+
+	serverCert, roots := testCertificate(t)
+	clientCAs, _ := testClientCertificate(t)
+
+	srv := newTestServer(t, serverCert, roots, clientCAs)
+	client := tlsClient(roots, nil)
+
+	for _, path := range []string{"/livez", "/readyz"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := client.Get(srv.URL + path)
+			if err != nil {
+				t.Fatalf("GET %s returned %v, want no error", path, err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+		})
+	}
+}
+
+// TestClientAuthDisabledByDefault proves existing behaviour is unaffected
+// when no trust store is configured.
+func TestClientAuthDisabledByDefault(t *testing.T) {
+	t.Parallel()
+
+	cert, _ := testCertificate(t)
+
+	srv, err := New(
+		"127.0.0.1:0",
+		time.Second,
+		func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return cert, nil },
+		testDeps(healthyProvider()),
+	)
+	if err != nil {
+		t.Fatalf("New returned %v, want no error", err)
+	}
+
+	if got := srv.http.TLSConfig.ClientAuth; got != tls.NoClientCert {
+		t.Errorf("ClientAuth = %v, want tls.NoClientCert when no pool is configured", got)
+	}
+}

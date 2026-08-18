@@ -36,14 +36,17 @@ the variable, rather than being silently ignored.
 | GOWEB_MAX_STALE_PERIOD | `15m` | How long the source may be unreadable before `/readyz` fails. |
 | GOWEB_ALLOW_EXPIRED_CERTIFICATE | `false` | Start with an already-expired certificate and report it instead of exiting. |
 | POD_NAME / POD_NAMESPACE | – | Shown on `/status`. |
+| GOWEB_MTLS_CLIENT_CA | _(unset)_ | PEM file of client CA certificates. Setting it enables client-certificate verification; leaving it unset disables it entirely. |
 
 # Endpoints
 
 | Path | Purpose |
 | ---- | ------- |
-| `/` | Landing page showing host, time, and peer certificate details. |
+| `/` | Landing page showing host, time, SNI, and — when a client certificate is verified — its identity. |
 | `/status` | Human-readable certificate and process diagnostics. |
 | `/status.json` | The same information as plain JSON, for machine consumers. |
+| `/whoami` | The client certificate the server verified, as a human-readable page. `403` when the caller presented none. |
+| `/whoami.json` | The same, as JSON. Always carries an `authenticated` boolean. |
 | `/livez` | Liveness. Reports only that the HTTP loop is running. |
 | `/readyz` | Readiness. Fails when no usable certificate exists, when the served certificate is outside its validity period, or when the source has been unreadable for longer than `GOWEB_MAX_STALE_PERIOD`. |
 
@@ -115,6 +118,117 @@ Notes for consumers:
 > is not fixed by restarting the process, which is why it degrades readiness
 > rather than liveness.
 
+# Client certificate authentication
+
+Client-certificate verification is off unless `GOWEB_MTLS_CLIENT_CA` is set.
+It is a listener-wide setting — every TLS handshake on the port may present a
+client certificate — but only `/whoami` and `/whoami.json` require one.
+`/livez`, `/readyz`, `/status` and `/status.json` never require a client
+certificate and work whether or not one is configured. They also work when
+one is configured but the caller presents none. What they cannot survive is
+a *presented* certificate that fails verification: under
+`VerifyClientCertIfGiven`, that aborts the TLS handshake before any route
+runs, so every endpoint on the listener fails alike — see the three-outcome
+table below. Kubernetes probes keep working unchanged only because probes
+never present a client certificate.
+
+`/` is not unaffected: it always prints the SNI name from the handshake, and
+when the caller presented a certificate the server verified, it additionally
+prints that certificate's subject, SANs and validity period. All of this is
+new output; see the config table above for how verification is enabled in
+the first place.
+
+Because a client certificate is only ever optional at the TLS layer, there
+are three observable outcomes, not two:
+
+| Client behaviour | Result |
+| --- | --- |
+| No client certificate | TLS succeeds; `GET /whoami` returns `403` |
+| Certificate not signed by a configured CA | TLS handshake fails; no HTTP response (curl exits `56`, `tlsv1 alert unknown ca`) |
+| Certificate signed by a configured CA | TLS succeeds; `GET /whoami` returns `200` |
+
+The middle row is not a `403`. An untrusted client certificate aborts the TLS
+handshake before any HTTP request is ever read, so nothing about the
+response can be inspected — an external suite has to assert on a connection
+error there, not on a status code.
+
+The trust store named by `GOWEB_MTLS_CLIENT_CA` is read once, at startup, and
+validated: every certificate in the file must be a genuine CA — a valid
+`BasicConstraints` extension with `IsCA` set, `KeyUsage` including
+`CertSign`, and inside its validity window. Requiring `CertSign` is stricter
+than RFC 5280, which permits a CA certificate to omit the `KeyUsage`
+extension entirely; a legitimate private-PKI root built that way is refused
+here by design, not because the file is corrupt. A file that cannot be
+read, contains no PEM certificate, contains a block that is not a valid CA,
+or contains a CERTIFICATE block whose PEM armour is malformed and was
+silently dropped by the decoder, fails startup outright — naming the
+offending certificate, or the block count that does not add up — rather
+than silently leaving client-certificate verification disabled or
+half-trusting a bundle. Replacing the trust store — adding or removing a
+trusted CA — requires restarting the process; unlike the served
+certificate, it is not watched for changes.
+
+Generate a client CA and a client certificate signed by it, then call the
+endpoint the way an external suite would:
+
+> **Never point `GOWEB_MTLS_CLIENT_CA` at `certs/demo.pem`.** `certs/demo.pem`
+> is a server leaf, not a CA, and `certs/demo-key.pem` is committed alongside
+> it, so pointing client-certificate verification at it would have made
+> anyone with this public repository a trusted client. That misuse is no
+> longer just discouraged: trust-store validation rejects any file that
+> isn't built from genuine CAs, so this now fails startup outright instead
+> of silently trusting whoever holds the demo key. `GOWEB_MTLS_CLIENT_CA`
+> names the client CA generated below (`client-ca.pem`); `--cacert
+> ./certs/demo.pem` in the command below is unrelated — that's curl
+> verifying the server's identity, not the server trusting a client.
+
+```bash
+make certs-client
+make build && GOWEB_MTLS_CLIENT_CA=./certs/client-ca.pem ./bin/server &
+
+curl --cacert ./certs/demo.pem \
+     --resolve raf.tech:8443:127.0.0.1 \
+     --cert ./certs/client.pem --key ./certs/client-key.pem \
+     https://raf.tech:8443/whoami.json
+```
+
+The demo certificate's SANs are `*.raf.tech` and `raf.tech` — not `localhost`
+— so `--resolve` points the hostname the certificate is actually valid for at
+the loopback address, rather than skipping server verification with `-k`
+inside the very section that teaches certificate verification.
+
+```json
+{"authenticated":true,"client":{"subject":"CN=goweb-client","issuer":"CN=goweb-client-ca","serial":"83851253258372398577627422287466861029","fingerprint_sha256":"e7467fda77ae120de4e71a9659106479a1ae8fbc2cd97f4bf8d7656305166a0f","dns_names":[],"uris":[],"email_addresses":[],"ip_addresses":[],"not_before":"2026-08-18T04:02:28Z","not_after":"2036-08-15T05:02:28Z","expires_in_seconds":315359986,"chain":["CN=goweb-client","CN=goweb-client-ca"]}}
+```
+
+Without a client certificate, `/whoami.json` returns `403` and:
+
+```json
+{"authenticated":false,"reason":"no client certificate presented"}
+```
+
+Both are single-line, compact JSON — no indentation, no spaces after `:` or
+`,` — unlike `/status.json`. `/status` is read by operators in a terminal,
+where indentation earns its bytes; `/whoami` exists to be matched, logged and
+diffed by e2e suites in other repositories, where layout is noise. Every
+response body is followed by exactly one trailing newline. `authenticated`
+is always present, so a consumer can branch on one field rather than on the
+absence of another.
+
+`/whoami` and `/whoami.json` send `Cache-Control: no-store` on every
+response, including refusals — the body carries one client's identity keyed
+only by the URL, and a cache must never store it and replay it to a
+different client. `/whoami` and `/status` additionally send `Vary: Accept`,
+since both negotiate their representation from that header; the dedicated
+`.json` endpoints have exactly one representation and don't send it.
+
+`/` sends the same `Cache-Control: no-store`, unconditionally, for the same
+reason — it too prints the verified client's identity when one is present.
+It cannot use `Vary` to describe that: a client certificate is not a request
+header, so no `Vary` value exists that would tell a cache the response
+differs by caller. `/status` and `/status.json` carry no per-client
+information and deliberately send neither header.
+
 # Certificate reloading
 
 The certificate is reloaded while the server runs, without dropping connections:
@@ -176,11 +290,12 @@ the bump.
 # Development
 
 ```bash
-make test    # go test -race -cover ./...
-make lint    # golangci-lint, installed into ./bin on first use
-make build   # binary into ./bin/server
-make run     # run from source
-make certs   # regenerate the self-signed demo certificates
+make test         # go test -race -cover ./...
+make lint         # golangci-lint, installed into ./bin on first use
+make build        # binary into ./bin/server
+make run          # run from source
+make certs        # regenerate the self-signed demo certificates
+make certs-client # generate a client CA and client certificate for mTLS testing
 ```
 
 `make docker-build` and `make docker-push` still exist for local use, but

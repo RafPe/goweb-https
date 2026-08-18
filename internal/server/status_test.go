@@ -230,6 +230,26 @@ func TestStatus_TextAndJSONAgree(t *testing.T) {
 	}
 }
 
+// TestStatusJSON_IsIndented pins /status.json to json.MarshalIndent - the
+// opposite of /whoami.json's single-line contract (see
+// TestWhoamiJSON_RefusalIsExplicit and the "compact JSON" assertion in
+// TestWhoami). The two endpoints diverge on layout deliberately, and this
+// stops either being "harmonised" with the other by accident.
+func TestStatusJSON_IsIndented(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	routes(testDeps(healthyProvider())).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status.json", nil))
+
+	body := rec.Body.String()
+	if got := strings.Count(body, "\n"); got < 2 {
+		t.Errorf("body has %d newlines, want an indented multi-line document\n%s", got, body)
+	}
+	if !strings.Contains(body, "\n  \"server\"") {
+		t.Errorf("body is not indented with two spaces\n%s", body)
+	}
+}
+
 func TestStatusJSON_MethodScoped(t *testing.T) {
 	t.Parallel()
 
@@ -237,5 +257,108 @@ func TestStatusJSON_MethodScoped(t *testing.T) {
 	routes(testDeps(healthyProvider())).ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/status.json", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("POST /status.json = %d, want 405", rec.Code)
+	}
+}
+
+// TestStatus_VaryAccept checks that /status, which changes representation
+// based on Accept (see prefersJSON), advertises that to caches - and that
+// /status.json, which has exactly one representation, does not.
+func TestStatus_VaryAccept(t *testing.T) {
+	t.Parallel()
+
+	handler := routes(testDeps(healthyProvider()))
+
+	tests := map[string]struct {
+		target   string
+		wantVary bool
+	}{
+		"status":      {target: "/status", wantVary: true},
+		"status.json": {target: "/status.json", wantVary: false},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.target, nil))
+
+			got := rec.Header().Get("Vary")
+			if tc.wantVary && got != "Accept" {
+				t.Errorf("Vary = %q, want %q", got, "Accept")
+			}
+			if !tc.wantVary && got != "" {
+				t.Errorf("Vary = %q, want unset", got)
+			}
+		})
+	}
+}
+
+// TestStatus_NoCacheControl guards against the no-store policy leaking from
+// /whoami onto /status: /status is diagnostic output with no per-client
+// identity in it, so it must not carry Cache-Control at all.
+func TestStatus_NoCacheControl(t *testing.T) {
+	t.Parallel()
+
+	handler := routes(testDeps(healthyProvider()))
+
+	for _, target := range []string{"/status", "/status.json"} {
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+
+			if got := rec.Header().Get("Cache-Control"); got != "" {
+				t.Errorf("Cache-Control = %q, want unset", got)
+			}
+		})
+	}
+}
+
+// unmarshalableValue fails json.Marshal deliberately, so
+// TestWriteJSON_EncodeFailureStaysJSON can exercise writeJSONEncodeError
+// without a production seam: a channel has no JSON representation.
+type unmarshalableValue struct {
+	Ch chan int `json:"ch"`
+}
+
+// TestWriteJSON_EncodeFailureStaysJSON drives writeJSON and writeCompactJSON
+// directly with a value that cannot be marshalled - the least invasive way to
+// reach writeJSONEncodeError, since every value that reaches it through the
+// handlers is already known to marshal cleanly. It checks the failure path
+// keeps Content-Type: application/json rather than falling back to
+// http.Error's text/plain, and that the body is still valid, parseable JSON.
+func TestWriteJSON_EncodeFailureStaysJSON(t *testing.T) {
+	t.Parallel()
+
+	deps := testDeps(healthyProvider())
+	bad := unmarshalableValue{Ch: make(chan int)}
+
+	for name, encode := range map[string]func(http.ResponseWriter, Dependencies, int, any){
+		"writeJSON":        writeJSON,
+		"writeCompactJSON": writeCompactJSON,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := httptest.NewRecorder()
+			encode(rec, deps, http.StatusOK, bad)
+
+			if rec.Code != http.StatusInternalServerError {
+				t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+			}
+			if got := rec.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+				t.Errorf("content type = %q, want application/json; charset=utf-8", got)
+			}
+
+			var wire map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &wire); err != nil {
+				t.Fatalf("body is not valid JSON: %v\n%s", err, rec.Body.String())
+			}
+			if _, ok := wire["error"]; !ok {
+				t.Errorf(`body is missing "error": %v`, wire)
+			}
+		})
 	}
 }

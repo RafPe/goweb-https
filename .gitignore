@@ -31,3 +31,9 @@ go.work.sum
 # .idea/
 # .vscode/
 bin/
+
+# Client CA and client certificate material from `make certs-client`. This is
+# per-developer scratch material for local mTLS testing, regenerated on
+# demand, and one of these files (client-ca-key.pem) is a CA signing key that
+# must never be committed.
+certs/client*.pem
