@@ -31,9 +31,9 @@ the variable, rather than being silently ignored.
 | GOWEB_PORT | `8443` | Listen port. |
 | TZ / TIMEZONE | `UTC` | Display timezone for timestamps. An unknown zone fails startup. |
 | GOWEB_SHUTDOWN_TIMEOUT | `10s` | How long in-flight requests may drain for on SIGTERM. |
-| GOWEB_RELOAD_DEBOUNCE | `500ms` | Quiet period after a filesystem event before re-reading. |
-| GOWEB_RELOAD_INTERVAL | `30s` | Periodic reconciliation against disk, independent of events. |
-| GOWEB_MAX_STALE_PERIOD | `15m` | How long the source may be unreadable before `/readyz` fails. |
+| GOWEB_RELOAD_DEBOUNCE | `500ms` | Quiet period after a filesystem event before re-reading. Applies to the certificate and the client CA trust bundle alike. |
+| GOWEB_RELOAD_INTERVAL | `30s` | Periodic reconciliation against disk, independent of events. Applies to both sources. |
+| GOWEB_MAX_STALE_PERIOD | `15m` | How long the certificate source may be unreadable before `/readyz` fails. It does not apply to the trust bundle, whose staleness is reported and never enforced — see [Trust bundle reloading](#trust-bundle-reloading). |
 | GOWEB_ALLOW_EXPIRED_CERTIFICATE | `false` | Start with an already-expired certificate and report it instead of exiting. |
 | POD_NAME / POD_NAMESPACE | – | Shown on `/status`. |
 | GOWEB_MTLS_CLIENT_CA | _(unset)_ | PEM file of client CA certificates. Setting it enables client-certificate verification; leaving it unset disables it entirely. |
@@ -48,7 +48,7 @@ the variable, rather than being silently ignored.
 | `/whoami` | The client certificate the server verified, as a human-readable page. `403` when the caller presented none. |
 | `/whoami.json` | The same, as JSON. Always carries an `authenticated` boolean. |
 | `/livez` | Liveness. Reports only that the HTTP loop is running. |
-| `/readyz` | Readiness. Fails when no usable certificate exists, when the served certificate is outside its validity period, or when the source has been unreadable for longer than `GOWEB_MAX_STALE_PERIOD`. |
+| `/readyz` | Readiness. Fails when no usable certificate exists, when the served certificate is outside its validity period, or when the certificate source has been unreadable for longer than `GOWEB_MAX_STALE_PERIOD`. A stale client CA trust bundle deliberately does **not** fail it. |
 
 Unknown paths return 404 and unsupported methods return 405.
 
@@ -95,6 +95,20 @@ true
     "validity": "valid",
     "expires_in_seconds": 315357333
   },
+  "trust_bundle": {
+    "file_path": "/tls/client-ca.pem",
+    "anchors": [
+      {
+        "subject": "CN=goweb-client-ca",
+        "fingerprint_sha256": "5704a5b2...9c1de4a0",
+        "not_after": "2036-08-15T09:50:28Z"
+      }
+    ],
+    "loaded_at": "2026-08-17T20:10:12Z",
+    "last_success": "2026-08-17T20:14:12Z",
+    "stale_seconds": 25,
+    "last_error": ""
+  },
   "readiness": { "ready": true }
 }
 ```
@@ -106,6 +120,16 @@ Notes for consumers:
   scrape can alert on a single number.
 - `certificate` is `null` when none is loaded. That is a different state from a
   certificate with blank fields.
+- `trust_bundle` is **absent entirely** when `GOWEB_MTLS_CLIENT_CA` is unset.
+  It is not `null` — a pod that is not doing client verification has no bundle
+  to describe, so the key is not there at all. Branch on its presence.
+- `trust_bundle.anchors[].fingerprint_sha256` is what a rotation should be
+  asserted on. A replacement CA commonly reuses the subject DN of the one it
+  replaces, so `subject` alone cannot tell the new CA from the old.
+- `trust_bundle.stale_seconds` counts from the last successful read of the
+  bundle, and `last_error` is non-empty while reloads are failing. Together
+  they mean "the pool being enforced is no longer the one on disk". Neither
+  affects `readiness`.
 - `dns_names` and `uris` are always arrays, never `null`.
 - `unverified_headers` echoes `X-Forwarded-For`, `X-Real-IP` and `X-Request-ID`
   exactly as received. They are client supplied. Do not treat them as identity
@@ -152,8 +176,8 @@ handshake before any HTTP request is ever read, so nothing about the
 response can be inspected — an external suite has to assert on a connection
 error there, not on a status code.
 
-The trust store named by `GOWEB_MTLS_CLIENT_CA` is read once, at startup, and
-validated: every certificate in the file must be a genuine CA — a valid
+The trust store named by `GOWEB_MTLS_CLIENT_CA` is validated on every read,
+at startup and on every reload: every certificate in the file must be a genuine CA — a valid
 `BasicConstraints` extension with `IsCA` set, `KeyUsage` including
 `CertSign`, and inside its validity window. Requiring `CertSign` is stricter
 than RFC 5280, which permits a CA certificate to omit the `KeyUsage`
@@ -164,9 +188,9 @@ or contains a CERTIFICATE block whose PEM armour is malformed and was
 silently dropped by the decoder, fails startup outright — naming the
 offending certificate, or the block count that does not add up — rather
 than silently leaving client-certificate verification disabled or
-half-trusting a bundle. Replacing the trust store — adding or removing a
-trusted CA — requires restarting the process; unlike the served
-certificate, it is not watched for changes.
+half-trusting a bundle. Once running, the same file is watched and the same
+checks are applied to every reload: see [Trust bundle
+reloading](#trust-bundle-reloading).
 
 Generate a client CA and a client certificate signed by it, then call the
 endpoint the way an external suite would:
@@ -245,6 +269,59 @@ The certificate is reloaded while the server runs, without dropping connections:
   strand an old certificate indefinitely.
 - If a reload fails, the last valid certificate keeps being served and the
   failure is surfaced through `/readyz` and `/status`.
+
+# Trust bundle reloading
+
+The client CA trust bundle named by `GOWEB_MTLS_CLIENT_CA` is watched the same
+way, on the same `GOWEB_RELOAD_DEBOUNCE` and `GOWEB_RELOAD_INTERVAL` knobs and
+through the same loop. Adding or removing a trusted CA takes effect on the next
+handshake, with no restart. Connections already established keep the pool they
+were authenticated under.
+
+Two rules govern what a reload may publish, and both exist because the
+interesting failure here opens the door rather than closing it:
+
+- **A failed reload never replaces the pool.** An unreadable file, a bundle
+  that parses to nothing, a block that is not a genuine CA, or a CERTIFICATE
+  block whose armour is malformed all leave the previous pool in force. This is
+  not merely conservative: Go substitutes the *system* root pool when the
+  configured client CA pool is `nil`, so publishing nothing would not reject
+  every client — it would accept every publicly issued client certificate as a
+  verified identity.
+- **A smaller bundle applies immediately.** Removing a CA is how revocation is
+  expressed here, so a bundle with fewer CAs is published as soon as it parses.
+  There is no rule that the pool may only grow and no waiting for a second
+  reconcile to agree, because either would delay a revocation by up to one
+  `GOWEB_RELOAD_INTERVAL`.
+
+> **Replace the bundle atomically. Do not rewrite it in place.** Kubernetes
+> projected volumes, ConfigMaps, Secrets and ClusterTrustBundles all write a new
+> timestamped directory and swap a `..data` symlink over it, so a reader never
+> observes a half-written file. A writer that rewrites the file in place can be
+> read mid-write, and a partially written bundle that still parses is
+> indistinguishable from a deliberate revocation — no reader-side logic can tell
+> the two apart, which is why this is an operational requirement rather than a
+> tolerated risk.
+
+## Readiness is deliberately asymmetric
+
+A stale or unreadable **trust bundle does not fail `/readyz`**, while a stale
+serving certificate still does.
+
+The asymmetry is the point. Without a valid serving certificate the pod cannot
+serve TLS at all. With a stale trust bundle it serves perfectly well and may
+merely be trusting a CA that has since been removed — and pulling a working test
+fixture out of service for a degraded-but-functioning condition costs more than
+it buys, especially mid-run for a suite in another repository.
+
+The condition is not silent. It is logged at warning level on every failed
+reconcile and reported in `/status.json` as `trust_bundle.last_error` and
+`trust_bundle.stale_seconds`, so an operator or a suite can see it and decide
+for itself.
+
+A dead *watcher* is a different matter and is still fatal: it means rotation is
+no longer observed at all and cannot recover without a restart, so it brings the
+process down rather than being logged and ignored.
 
 # Releases
 
