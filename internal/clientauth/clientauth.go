@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"slices"
 	"time"
 )
 
@@ -81,8 +82,8 @@ func IdentityFrom(state *tls.ConnectionState) (Identity, bool) {
 		Issuer:            leaf.Issuer.String(),
 		Serial:            leaf.SerialNumber.String(),
 		FingerprintSHA256: hex.EncodeToString(fingerprint[:]),
-		DNSNames:          leaf.DNSNames,
-		EmailAddresses:    leaf.EmailAddresses,
+		DNSNames:          slices.Clone(leaf.DNSNames),
+		EmailAddresses:    slices.Clone(leaf.EmailAddresses),
 		NotBefore:         leaf.NotBefore,
 		NotAfter:          leaf.NotAfter,
 	}

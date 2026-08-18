@@ -4,11 +4,15 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/pem"
 	"math/big"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -128,6 +132,67 @@ func leafCertificate(t *testing.T, commonName string) *x509.Certificate {
 	return cert
 }
 
+// issuedLeaf returns a leaf certificate carrying DNS, email, URI and IP SANs,
+// signed by a throwaway issuing CA, together with that CA certificate.
+//
+// A real two-certificate chain is used (rather than a self-signed leaf) so
+// the "verified chain" subtest can assert the documented leaf-first ordering
+// of Identity.Chain against something that isn't trivially a single-element
+// list, and so every SAN kind Identity exposes has a real source value to
+// check against.
+func issuedLeaf(t *testing.T, commonName string) (leaf, ca *x509.Certificate) {
+	t.Helper()
+
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ca key: %v", err)
+	}
+	caTemplate := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-issuing-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, &caTemplate, &caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create ca certificate: %v", err)
+	}
+	ca, err = x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatalf("parse ca certificate: %v", err)
+	}
+
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("generate leaf key: %v", err)
+	}
+	leafTemplate := x509.Certificate{
+		SerialNumber:   big.NewInt(42),
+		Subject:        pkix.Name{CommonName: commonName},
+		DNSNames:       []string{"client.example"},
+		EmailAddresses: []string{"client@example.com"},
+		URIs:           []*url.URL{{Scheme: "spiffe", Host: "example.com", Path: "/client"}},
+		IPAddresses:    []net.IP{net.ParseIP("192.0.2.1")},
+		NotBefore:      time.Now().Add(-time.Hour),
+		NotAfter:       time.Now().Add(time.Hour),
+		KeyUsage:       x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:    []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, &leafTemplate, ca, &leafKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create leaf certificate: %v", err)
+	}
+	leaf, err = x509.ParseCertificate(leafDER)
+	if err != nil {
+		t.Fatalf("parse leaf certificate: %v", err)
+	}
+
+	return leaf, ca
+}
+
 func TestIdentityFrom(t *testing.T) {
 	leaf := leafCertificate(t, "verified-client")
 
@@ -143,6 +208,17 @@ func TestIdentityFrom(t *testing.T) {
 		}
 	})
 
+	// A non-empty VerifiedChains slice whose first chain is itself empty is
+	// the shape crypto/tls would never produce, but IdentityFrom guards
+	// against it explicitly (it indexes VerifiedChains[0][0]); this exercises
+	// that guard directly rather than trusting it by inspection.
+	t.Run("verified chain present but empty", func(t *testing.T) {
+		state := &tls.ConnectionState{VerifiedChains: [][]*x509.Certificate{{}}}
+		if _, ok := IdentityFrom(state); ok {
+			t.Error("IdentityFrom reported an identity for an empty verified chain")
+		}
+	})
+
 	// The whole point of the package: a certificate the client presented but
 	// the server did not verify is not an identity. If this test ever passes
 	// an identity back, something started reading PeerCertificates.
@@ -154,9 +230,10 @@ func TestIdentityFrom(t *testing.T) {
 	})
 
 	t.Run("verified chain", func(t *testing.T) {
+		verifiedLeaf, ca := issuedLeaf(t, "verified-client")
 		state := &tls.ConnectionState{
-			PeerCertificates: []*x509.Certificate{leaf},
-			VerifiedChains:   [][]*x509.Certificate{{leaf}},
+			PeerCertificates: []*x509.Certificate{verifiedLeaf},
+			VerifiedChains:   [][]*x509.Certificate{{verifiedLeaf, ca}},
 		}
 
 		identity, ok := IdentityFrom(state)
@@ -166,16 +243,35 @@ func TestIdentityFrom(t *testing.T) {
 		if got, want := identity.Subject, "CN=verified-client"; got != want {
 			t.Errorf("Subject = %q, want %q", got, want)
 		}
+		if got, want := identity.Issuer, ca.Subject.String(); got != want {
+			t.Errorf("Issuer = %q, want %q", got, want)
+		}
 		if got, want := identity.Serial, "42"; got != want {
 			t.Errorf("Serial = %q, want %q", got, want)
 		}
-		if len(identity.FingerprintSHA256) != 64 {
-			t.Errorf("FingerprintSHA256 = %q, want 64 hex characters", identity.FingerprintSHA256)
+		wantFingerprint := sha256.Sum256(verifiedLeaf.Raw)
+		if got, want := identity.FingerprintSHA256, hex.EncodeToString(wantFingerprint[:]); got != want {
+			t.Errorf("FingerprintSHA256 = %q, want %q", got, want)
+		}
+		if !identity.NotBefore.Equal(verifiedLeaf.NotBefore) {
+			t.Errorf("NotBefore = %v, want %v", identity.NotBefore, verifiedLeaf.NotBefore)
+		}
+		if !identity.NotAfter.Equal(verifiedLeaf.NotAfter) {
+			t.Errorf("NotAfter = %v, want %v", identity.NotAfter, verifiedLeaf.NotAfter)
 		}
 		if got, want := identity.DNSNames, []string{"client.example"}; !slices.Equal(got, want) {
 			t.Errorf("DNSNames = %v, want %v", got, want)
 		}
-		if got, want := identity.Chain, []string{"CN=verified-client"}; !slices.Equal(got, want) {
+		if got, want := identity.EmailAddresses, []string{"client@example.com"}; !slices.Equal(got, want) {
+			t.Errorf("EmailAddresses = %v, want %v", got, want)
+		}
+		if got, want := identity.URIs, []string{"spiffe://example.com/client"}; !slices.Equal(got, want) {
+			t.Errorf("URIs = %v, want %v", got, want)
+		}
+		if got, want := identity.IPAddresses, []string{"192.0.2.1"}; !slices.Equal(got, want) {
+			t.Errorf("IPAddresses = %v, want %v", got, want)
+		}
+		if got, want := identity.Chain, []string{verifiedLeaf.Subject.String(), ca.Subject.String()}; !slices.Equal(got, want) {
 			t.Errorf("Chain = %v, want %v", got, want)
 		}
 	})
