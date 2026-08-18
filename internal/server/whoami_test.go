@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +94,17 @@ func TestWhoami(t *testing.T) {
 		wantExpires := float64(int64(trustedClient.Leaf.NotAfter.Sub(testNow).Seconds()))
 		if got := clientWire["expires_in_seconds"]; got != wantExpires {
 			t.Errorf(`wire["client"]["expires_in_seconds"] = %v, want %v`, got, wantExpires)
+		}
+
+		// /whoami and /whoami.json are compact by contract - unlike /status,
+		// see TestStatusJSON_IsIndented - so the only newline in the body is
+		// the single trailing one writeCompactJSON appends. A future switch
+		// back to json.MarshalIndent must fail this, not just look different.
+		if got := strings.Count(string(body), "\n"); got != 1 {
+			t.Errorf("body has %d newlines, want exactly 1 (compact JSON)\n%s", got, body)
+		}
+		if !strings.HasSuffix(string(body), "\n") {
+			t.Errorf("body does not end with a newline\n%s", body)
 		}
 	})
 
@@ -210,29 +222,60 @@ func TestWhoamiWithoutTrustStore(t *testing.T) {
 // does). Without this, an `omitempty` added to WhoamiReport.Authenticated
 // would drop the field from exactly this response and nothing would notice:
 // the refusal JSON was never actually fetched by any test.
+//
+// It checks both routes that can produce this document - /whoami.json
+// unconditionally, and /whoami when the caller explicitly asks for JSON -
+// and, now that the output is compact, asserts the exact byte string as well
+// as the decoded keys: a single-line body is stable enough to compare
+// literally, which an indented one would not be.
 func TestWhoamiJSON_RefusalIsExplicit(t *testing.T) {
 	t.Parallel()
 
-	rec := do(t, routes(testDeps(healthyProvider())), http.MethodGet, "/whoami.json")
-	if rec.Code != http.StatusForbidden {
-		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
-	}
-
-	var wire map[string]any
-	if err := json.Unmarshal(rec.Body.Bytes(), &wire); err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-
-	authenticated, ok := wire["authenticated"]
-	if !ok {
-		t.Fatal(`wire is missing "authenticated"`)
-	}
-	if authenticated != false {
-		t.Errorf(`wire["authenticated"] = %#v, want false`, authenticated)
-	}
 	// The literal string is contract: external suites match on it.
-	if got, want := wire["reason"], noClientCertificate; got != want {
-		t.Errorf(`wire["reason"] = %#v, want %q`, got, want)
+	const wantBody = `{"authenticated":false,"reason":"no client certificate presented"}` + "\n"
+
+	tests := map[string]struct {
+		target string
+		accept string
+	}{
+		"whoami.json":             {target: "/whoami.json"},
+		"whoami with Accept:json": {target: "/whoami", accept: "application/json"},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+			if tc.accept != "" {
+				req.Header.Set("Accept", tc.accept)
+			}
+			rec := httptest.NewRecorder()
+			routes(testDeps(healthyProvider())).ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+			}
+			if got := rec.Body.String(); got != wantBody {
+				t.Errorf("body = %q, want %q", got, wantBody)
+			}
+
+			var wire map[string]any
+			if err := json.Unmarshal(rec.Body.Bytes(), &wire); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+
+			authenticated, ok := wire["authenticated"]
+			if !ok {
+				t.Fatal(`wire is missing "authenticated"`)
+			}
+			if authenticated != false {
+				t.Errorf(`wire["authenticated"] = %#v, want false`, authenticated)
+			}
+			if got, want := wire["reason"], noClientCertificate; got != want {
+				t.Errorf(`wire["reason"] = %#v, want %q`, got, want)
+			}
+		})
 	}
 }
 

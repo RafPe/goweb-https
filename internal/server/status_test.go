@@ -230,6 +230,26 @@ func TestStatus_TextAndJSONAgree(t *testing.T) {
 	}
 }
 
+// TestStatusJSON_IsIndented pins /status.json to json.MarshalIndent - the
+// opposite of /whoami.json's single-line contract (see
+// TestWhoamiJSON_RefusalIsExplicit and the "compact JSON" assertion in
+// TestWhoami). The two endpoints diverge on layout deliberately, and this
+// stops either being "harmonised" with the other by accident.
+func TestStatusJSON_IsIndented(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	routes(testDeps(healthyProvider())).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/status.json", nil))
+
+	body := rec.Body.String()
+	if got := strings.Count(body, "\n"); got < 2 {
+		t.Errorf("body has %d newlines, want an indented multi-line document\n%s", got, body)
+	}
+	if !strings.Contains(body, "\n  \"server\"") {
+		t.Errorf("body is not indented with two spaces\n%s", body)
+	}
+}
+
 func TestStatusJSON_MethodScoped(t *testing.T) {
 	t.Parallel()
 

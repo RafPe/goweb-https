@@ -173,10 +173,39 @@ func handleStatusJSON(deps Dependencies) http.HandlerFunc {
 func writeJSON(w http.ResponseWriter, deps Dependencies, status int, v any) {
 	body, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		deps.Logger.Error("encoding status document failed", "err", err)
-		http.Error(w, `{"error":"failed to encode status"}`, http.StatusInternalServerError)
+		writeJSONEncodeError(w, deps, err)
 		return
 	}
+	writeJSONBody(w, status, body)
+}
+
+// writeCompactJSON encodes v as a single line and sends it as a complete
+// response.
+//
+// Used by /whoami and /whoami.json, not /status: those are consumed by
+// external e2e suites, where layout is noise and a single line is easier to
+// match, log, and diff than an indented document.
+func writeCompactJSON(w http.ResponseWriter, deps Dependencies, status int, v any) {
+	body, err := json.Marshal(v)
+	if err != nil {
+		writeJSONEncodeError(w, deps, err)
+		return
+	}
+	writeJSONBody(w, status, body)
+}
+
+// writeJSONEncodeError reports a JSON encoding failure as a 500. Shared by
+// writeJSON and writeCompactJSON so the error path cannot drift between the
+// two encodings.
+func writeJSONEncodeError(w http.ResponseWriter, deps Dependencies, err error) {
+	deps.Logger.Error("encoding status document failed", "err", err)
+	http.Error(w, `{"error":"failed to encode status"}`, http.StatusInternalServerError)
+}
+
+// writeJSONBody sends body as a complete JSON response. Shared by writeJSON
+// and writeCompactJSON so the trailing newline, the Content-Type header, and
+// the WriteHeader-then-Write ordering cannot drift between the two encodings.
+func writeJSONBody(w http.ResponseWriter, status int, body []byte) {
 	body = append(body, '\n')
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")

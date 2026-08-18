@@ -90,13 +90,14 @@ func whoamiStatus(report WhoamiReport) int {
 //
 // Like /status it honours an explicit Accept: application/json, so a consumer
 // that cannot be pointed at a different URL still has a machine-readable
-// option.
+// option. Unlike /status, that JSON is compact rather than indented - see
+// writeCompactJSON.
 func handleWhoami(deps Dependencies) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		report := buildWhoami(deps, r)
 
 		if prefersJSON(r) {
-			writeJSON(w, deps, whoamiStatus(report), report)
+			writeCompactJSON(w, deps, whoamiStatus(report), report)
 			return
 		}
 
@@ -104,11 +105,12 @@ func handleWhoami(deps Dependencies) http.HandlerFunc {
 	}
 }
 
-// handleWhoamiJSON serves the machine-readable identity document.
+// handleWhoamiJSON serves the machine-readable identity document, compact
+// rather than indented: see writeCompactJSON.
 func handleWhoamiJSON(deps Dependencies) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		report := buildWhoami(deps, r)
-		writeJSON(w, deps, whoamiStatus(report), report)
+		writeCompactJSON(w, deps, whoamiStatus(report), report)
 	}
 }
 
