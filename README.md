@@ -155,13 +155,18 @@ error there, not on a status code.
 The trust store named by `GOWEB_MTLS_CLIENT_CA` is read once, at startup, and
 validated: every certificate in the file must be a genuine CA — a valid
 `BasicConstraints` extension with `IsCA` set, `KeyUsage` including
-`CertSign`, and inside its validity window. A file that cannot be read,
-contains no PEM certificate, or contains a block that is not a valid CA
-fails startup outright, naming the offending certificate, rather than
-silently leaving client-certificate verification disabled or half-trusting
-a bundle. Replacing the trust store — adding or removing a trusted CA —
-requires restarting the process; unlike the served certificate, it is not
-watched for changes.
+`CertSign`, and inside its validity window. Requiring `CertSign` is stricter
+than RFC 5280, which permits a CA certificate to omit the `KeyUsage`
+extension entirely; a legitimate private-PKI root built that way is refused
+here by design, not because the file is corrupt. A file that cannot be
+read, contains no PEM certificate, contains a block that is not a valid CA,
+or contains a CERTIFICATE block whose PEM armour is malformed and was
+silently dropped by the decoder, fails startup outright — naming the
+offending certificate, or the block count that does not add up — rather
+than silently leaving client-certificate verification disabled or
+half-trusting a bundle. Replacing the trust store — adding or removing a
+trusted CA — requires restarting the process; unlike the served
+certificate, it is not watched for changes.
 
 Generate a client CA and a client certificate signed by it, then call the
 endpoint the way an external suite would:
@@ -216,6 +221,13 @@ only by the URL, and a cache must never store it and replay it to a
 different client. `/whoami` and `/status` additionally send `Vary: Accept`,
 since both negotiate their representation from that header; the dedicated
 `.json` endpoints have exactly one representation and don't send it.
+
+`/` sends the same `Cache-Control: no-store`, unconditionally, for the same
+reason — it too prints the verified client's identity when one is present.
+It cannot use `Vary` to describe that: a client certificate is not a request
+header, so no `Vary` value exists that would tell a cache the response
+differs by caller. `/status` and `/status.json` carry no per-client
+information and deliberately send neither header.
 
 # Certificate reloading
 

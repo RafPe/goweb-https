@@ -66,6 +66,22 @@ func caCertPEM(t *testing.T, commonName string) []byte {
 	return certPEM(t, caTemplate(commonName))
 }
 
+// corruptArmourCertificateBlock returns a hand-written PEM block whose
+// armour ("-----BEGIN/END CERTIFICATE-----") is well-formed but whose body
+// contains '!', a byte outside the base64 alphabet.
+//
+// This must not be built with pem.EncodeToMemory: that always produces valid
+// base64, so at worst it exercises the malformed-DER path already covered by
+// "bundle mixing a valid CA with a malformed CERTIFICATE block" above -
+// x509.ParseCertificate rejects garbage bytes loudly. A corrupt *armour*
+// body is a different failure mode: pem.Decode does not report it as an
+// error at all, it silently skips the block and resumes decoding at the
+// next one, so this is the only way to reach the code path this test exists
+// to cover.
+func corruptArmourCertificateBlock() []byte {
+	return []byte("-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEF!AOCAQ8A\n-----END CERTIFICATE-----\n")
+}
+
 // writeFile writes content to a file named name inside a fresh temporary
 // directory and returns its path.
 func writeFile(t *testing.T, name string, content []byte) string {
@@ -129,7 +145,16 @@ func TestLoadTrustStore(t *testing.T) {
 			},
 			wantErr: "not a CA",
 		},
-		"certificate with no basic constraints extension": {
+		// Omitting the BasicConstraints extension entirely leaves both
+		// BasicConstraintsValid and IsCA false once the certificate is
+		// parsed back - Go derives IsCA solely from that extension, so this
+		// case is actually caught by validateAnchor's !cert.IsCA arm, the
+		// same arm every non-CA case in this table exercises. The
+		// !cert.BasicConstraintsValid guard is kept for defense in depth
+		// against a hand-constructed x509.Certificate where the two fields
+		// could disagree, but no case here exercises it independently of
+		// !IsCA - x509.ParseCertificate can't produce that combination.
+		"CA certificate with BasicConstraints extension omitted": {
 			path: func(t *testing.T) string {
 				template := caTemplate("no-basic-constraints")
 				template.BasicConstraintsValid = false
@@ -144,7 +169,7 @@ func TestLoadTrustStore(t *testing.T) {
 				template.KeyUsage = x509.KeyUsageDigitalSignature
 				return writeFile(t, "ca.pem", certPEM(t, template))
 			},
-			wantErr: "KeyUsageCertSign",
+			wantErr: "no keyCertSign key usage",
 		},
 		"expired CA": {
 			path: func(t *testing.T) string {
@@ -174,6 +199,21 @@ func TestLoadTrustStore(t *testing.T) {
 			// because one block parsed; a trust store must not silently
 			// drop the corrupt CA and trust only the rest of the bundle.
 			wantErr: "parse certificate",
+		},
+		"bundle with a corrupt-armour CERTIFICATE block between two valid CAs": {
+			path: func(t *testing.T) string {
+				var bundle []byte
+				bundle = append(bundle, caCertPEM(t, "first-ca")...)
+				bundle = append(bundle, corruptArmourCertificateBlock()...)
+				bundle = append(bundle, caCertPEM(t, "second-ca")...)
+				return writeFile(t, "bundle.pem", bundle)
+			},
+			// pem.Decode treats the middle block as if it were never there:
+			// it decodes the two well-formed CAs and returns with rest fully
+			// consumed, so nothing here looks incomplete by the usual
+			// signals. Only comparing the marker count against the decoded
+			// count catches the drop.
+			wantErr: "found 3 ",
 		},
 		"bundle with a non-CERTIFICATE PEM block alongside a valid CA": {
 			path: func(t *testing.T) string {

@@ -430,6 +430,37 @@ func TestRootShowsSNIAndVerifiedClient(t *testing.T) {
 	})
 }
 
+// TestRootNoCacheControl checks that / sends Cache-Control: no-store
+// unconditionally, whether or not the request carries a client certificate.
+// / has no way to describe the certificate-keyed part of its response with
+// Vary - a client certificate is not a request header - so no-store is the
+// only policy available, and it must not depend on whether this particular
+// request happened to present one.
+func TestRootNoCacheControl(t *testing.T) {
+	serverCert, roots := testCertificate(t)
+	clientCAs, trustedClient := testClientCertificate(t)
+	srv := newTestServer(t, serverCert, roots, clientCAs)
+
+	tests := map[string]*tls.Certificate{
+		"without a client certificate": nil,
+		"with a client certificate":    trustedClient,
+	}
+
+	for name, cert := range tests {
+		t.Run(name, func(t *testing.T) {
+			resp, err := tlsClient(roots, cert).Get(srv.URL + "/")
+			if err != nil {
+				t.Fatalf("GET / returned %v, want no error", err)
+			}
+			defer resp.Body.Close()
+
+			if got := resp.Header.Get("Cache-Control"); got != "no-store" {
+				t.Errorf("Cache-Control = %q, want %q", got, "no-store")
+			}
+		})
+	}
+}
+
 // testClientCertificate issues a clientAuth leaf, "test-client", from a
 // throwaway CA distinct from the server's, and returns a pool trusting that
 // CA together with the leaf.

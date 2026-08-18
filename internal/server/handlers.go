@@ -16,6 +16,13 @@ const expiryWarningThreshold = 30 * time.Minute
 // handleRoot serves the human-facing landing page.
 func handleRoot(deps Dependencies) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Set unconditionally, before anything is written: the response
+		// varies by client certificate, which a cache cannot see and so
+		// cannot key on, and this page prints the current time on every
+		// request regardless, so it was never usefully cacheable anyway.
+		// See noStore.
+		noStore(w)
+
 		var b strings.Builder
 
 		fmt.Fprintf(&b, "Hello there! I am serving this content via https :) \n")
@@ -193,6 +200,27 @@ func formatTime(t time.Time, location *time.Location) string {
 		return utc
 	}
 	return fmt.Sprintf("%s (%s)", local, utc)
+}
+
+// noStore marks the response as never cacheable.
+//
+// It guards against a specific replay: a response that carries one client's
+// verified identity is keyed only by URL, not by which client asked for it,
+// so a cache sitting in front of the server could store one client's
+// identity and serve it back to a different client that later requests the
+// same path. Certificate-bearing responses make this worse than the usual
+// per-user cache leak - the response varies by client certificate, which is
+// not a request header, so no Vary value exists that could describe the
+// variation to a cache; no-store is the only policy a cache can be told.
+//
+// Call it explicitly from every handler whose response is shaped by the
+// caller's verified identity - currently / and /whoami - rather than folding
+// it into writeText or writeJSON: diagnostic endpoints like /status carry no
+// per-client information and must not send it, and a shared writer would
+// make that exclusion something a future handler has to remember to opt out
+// of instead of something it has to deliberately opt into.
+func noStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
 }
 
 // writeText sends a complete plain-text response.

@@ -8,6 +8,7 @@
 package clientauth
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -19,6 +20,13 @@ import (
 	"slices"
 	"time"
 )
+
+// certificateArmourMarker is the literal PEM boundary that opens every
+// CERTIFICATE block. Counting it against the number of CERTIFICATE blocks
+// LoadTrustStore actually decodes is what catches a corrupt block that
+// pem.Decode would otherwise drop without a trace: see the "corrupt PEM
+// armour" paragraph on LoadTrustStore.
+const certificateArmourMarker = "-----BEGIN CERTIFICATE-----"
 
 // TrustStore is a validated set of client CA trust anchors: every
 // certificate it holds passed the checks in LoadTrustStore, so the pool it
@@ -81,6 +89,17 @@ type Anchor struct {
 // beside a valid one in a bundle and be silently dropped rather than fixed.
 // For a trust store, partial success is the wrong default.
 //
+// pem.Decode itself has the same failure mode one level lower: a block whose
+// armour is well-formed but whose base64 body is corrupt is not reported as
+// an error at all - it is silently skipped, and decoding resumes at the next
+// good block. A three-CA bundle with one mangled entry would then load two
+// anchors, log two, and look perfectly healthy while every client under the
+// third CA is refused with no diagnostic anywhere. LoadTrustStore guards
+// against that by counting "-----BEGIN CERTIFICATE-----" markers in the raw
+// file and comparing that count to the number of CERTIFICATE blocks it
+// actually decoded; a shortfall fails startup by name rather than passing
+// unnoticed.
+//
 // A file that yields no certificate is an error rather than an empty pool.
 // An empty pool would fail every client certificate presented to it, which is
 // an operator mistake and not a configuration anyone intends.
@@ -94,6 +113,9 @@ func LoadTrustStore(path string) (*TrustStore, error) {
 	pool := x509.NewCertPool()
 	var anchors []Anchor
 
+	wantBlocks := bytes.Count(encoded, []byte(certificateArmourMarker))
+	var decodedBlocks int
+
 	rest := encoded
 	for {
 		var block *pem.Block
@@ -104,6 +126,7 @@ func LoadTrustStore(path string) (*TrustStore, error) {
 		if block.Type != "CERTIFICATE" {
 			continue
 		}
+		decodedBlocks++
 		cert, err := x509.ParseCertificate(block.Bytes)
 		if err != nil {
 			return nil, fmt.Errorf("clientauth: %s: parse certificate: %w", path, err)
@@ -124,6 +147,16 @@ func LoadTrustStore(path string) (*TrustStore, error) {
 		})
 	}
 
+	// Checked before the empty-anchors case below so a file with a single,
+	// entirely corrupt block (wantBlocks=1, decodedBlocks=0) is reported as
+	// a dropped block rather than as the less specific "no certificate" -
+	// the operator needs to know a block was there and was lost, not just
+	// that the result is empty.
+	if decodedBlocks < wantBlocks {
+		return nil, fmt.Errorf("clientauth: %s: found %d %q marker(s) but only decoded %d CERTIFICATE block(s); a block's PEM armour is malformed and was silently dropped",
+			path, wantBlocks, certificateArmourMarker, decodedBlocks)
+	}
+
 	if len(anchors) == 0 {
 		return nil, fmt.Errorf("clientauth: %s contains no PEM certificate", path)
 	}
@@ -138,7 +171,8 @@ func validateAnchor(cert *x509.Certificate) error {
 		return errors.New("not a CA certificate")
 	}
 	if cert.KeyUsage&x509.KeyUsageCertSign == 0 {
-		return errors.New("missing KeyUsageCertSign")
+		return errors.New("no keyCertSign key usage: RFC 5280 permits a CA certificate to omit the " +
+			"KeyUsage extension entirely, but this server requires certSign to be asserted explicitly")
 	}
 	now := time.Now()
 	if now.Before(cert.NotBefore) {

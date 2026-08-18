@@ -96,12 +96,9 @@ func handleWhoami(deps Dependencies) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		report := buildWhoami(deps, r)
 
-		// This response carries one client's verified identity, keyed only by
-		// URL. Without no-store, a cache could store it and replay it to a
-		// different client that later requests the same path - and a cached
-		// refusal would be just as wrong, served to a client that did present
-		// a certificate.
-		w.Header().Set("Cache-Control", "no-store")
+		// See noStore. A cached refusal would be just as wrong here as a
+		// cached success: served to a client that did present a certificate.
+		noStore(w)
 		// The representation depends on Accept - see prefersJSON - so a cache
 		// or proxy must not conflate the JSON and text bodies for this URL.
 		w.Header().Set("Vary", "Accept")
@@ -121,10 +118,9 @@ func handleWhoamiJSON(deps Dependencies) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		report := buildWhoami(deps, r)
 
-		// See handleWhoami: the same replay risk applies to this dedicated
-		// JSON endpoint. No Vary here - unlike /whoami, this path has exactly
+		// See noStore. No Vary here - unlike /whoami, this path has exactly
 		// one representation.
-		w.Header().Set("Cache-Control", "no-store")
+		noStore(w)
 
 		writeCompactJSON(w, deps, whoamiStatus(report), report)
 	}
