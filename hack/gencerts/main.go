@@ -38,24 +38,58 @@ func main() {
 	}
 }
 
-func run(dir, commonName string, dnsNames []string, validFor time.Duration) error {
+// issued is a generated certificate together with the key that signs for it.
+type issued struct {
+	template *x509.Certificate
+	der      []byte
+	key      *rsa.PrivateKey
+}
+
+// issue creates a certificate from template, signed by parent. A nil parent
+// makes it self-signed, which is how the root of each chain is produced.
+func issue(template *x509.Certificate, parent *issued) (*issued, error) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		return fmt.Errorf("generate key: %w", err)
+		return nil, fmt.Errorf("generate key: %w", err)
 	}
 
 	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
 	if err != nil {
-		return fmt.Errorf("generate serial: %w", err)
+		return nil, fmt.Errorf("generate serial: %w", err)
+	}
+	template.SerialNumber = serial
+
+	signerTemplate, signerKey := template, key
+	if parent != nil {
+		signerTemplate, signerKey = parent.template, parent.key
 	}
 
+	der, err := x509.CreateCertificate(rand.Reader, template, signerTemplate, &key.PublicKey, signerKey)
+	if err != nil {
+		return nil, fmt.Errorf("create certificate: %w", err)
+	}
+
+	return &issued{template: template, der: der, key: key}, nil
+}
+
+// pemPair renders a certificate and its key as PEM.
+func pemPair(c *issued) (certPEM, keyPEM []byte, err error) {
+	keyDER, err := x509.MarshalPKCS8PrivateKey(c.key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("marshal key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: c.der}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
+		nil
+}
+
+func run(dir, commonName string, dnsNames []string, validFor time.Duration) error {
 	now := time.Now()
 	template := x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: commonName},
-		DNSNames:     dnsNames,
-		NotBefore:    now.Add(-time.Hour),
-		NotAfter:     now.Add(validFor),
+		Subject:   pkix.Name{CommonName: commonName},
+		DNSNames:  dnsNames,
+		NotBefore: now.Add(-time.Hour),
+		NotAfter:  now.Add(validFor),
 
 		// A server leaf, not a CA. The previous regeneration produced
 		// CA:TRUE with no key usage at all, which does not model the profile
@@ -66,18 +100,15 @@ func run(dir, commonName string, dnsNames []string, validFor time.Duration) erro
 		IsCA:                  false,
 	}
 
-	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	server, err := issue(&template, nil)
 	if err != nil {
-		return fmt.Errorf("create certificate: %w", err)
+		return fmt.Errorf("server certificate: %w", err)
 	}
 
-	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	certPEM, keyPEM, err := pemPair(server)
 	if err != nil {
-		return fmt.Errorf("marshal key: %w", err)
+		return err
 	}
-
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
 
 	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
