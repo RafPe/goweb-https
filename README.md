@@ -42,7 +42,7 @@ the variable, rather than being silently ignored.
 
 | Path | Purpose |
 | ---- | ------- |
-| `/` | Landing page showing host, time, and peer certificate details. |
+| `/` | Landing page showing host, time, SNI, and — when a client certificate is verified — its identity. |
 | `/status` | Human-readable certificate and process diagnostics. |
 | `/status.json` | The same information as plain JSON, for machine consumers. |
 | `/whoami` | The client certificate the server verified, as a human-readable page. `403` when the caller presented none. |
@@ -123,9 +123,15 @@ Notes for consumers:
 Client-certificate verification is off unless `GOWEB_MTLS_CLIENT_CA` is set.
 It is a listener-wide setting — every TLS handshake on the port may present a
 client certificate — but only `/whoami` and `/whoami.json` require one.
-`/livez`, `/readyz`, `/status`, `/status.json` and `/` are unaffected whether
-or not a client certificate is configured or presented, so Kubernetes probes
+`/livez`, `/readyz`, `/status` and `/status.json` are unaffected whether or
+not a client certificate is configured or presented, so Kubernetes probes
 keep working unchanged.
+
+`/` is not unaffected: it always prints the SNI name from the handshake, and
+when the caller presented a certificate the server verified, it additionally
+prints that certificate's subject, SANs and validity period. All of this is
+new output; see the config table above for how verification is enabled in
+the first place.
 
 Because a client certificate is only ever optional at the TLS layer, there
 are three observable outcomes, not two:
@@ -151,18 +157,31 @@ watched for changes.
 Generate a client CA and a client certificate signed by it, then call the
 endpoint the way an external suite would:
 
+> **Never point `GOWEB_MTLS_CLIENT_CA` at `certs/demo.pem`.** `certs/demo-key.pem`
+> is committed, and the demo leaf carries `ExtKeyUsage: ClientAuth` alongside
+> `ServerAuth`, so trusting it as a client CA would make anyone with this
+> public repository a trusted client. `GOWEB_MTLS_CLIENT_CA` names the client
+> CA generated below (`client-ca.pem`); `--cacert ./certs/demo.pem` in the
+> command below is unrelated — that's curl verifying the server's identity,
+> not the server trusting a client.
+
 ```bash
 make certs-client
-
-GOWEB_MTLS_CLIENT_CA=./certs/client-ca.pem ./bin/goweb-https &
+make build && GOWEB_MTLS_CLIENT_CA=./certs/client-ca.pem ./bin/server &
 
 curl --cacert ./certs/demo.pem \
+     --resolve raf.tech:8443:127.0.0.1 \
      --cert ./certs/client.pem --key ./certs/client-key.pem \
-     https://localhost:8443/whoami.json
+     https://raf.tech:8443/whoami.json
 ```
 
+The demo certificate's SANs are `*.raf.tech` and `raf.tech` — not `localhost`
+— so `--resolve` points the hostname the certificate is actually valid for at
+the loopback address, rather than skipping server verification with `-k`
+inside the very section that teaches certificate verification.
+
 ```json
-{"authenticated":true,"client":{"subject":"CN=goweb-client","issuer":"CN=goweb-client-ca","serial":"338166764635016458982713045992107339775","fingerprint_sha256":"daea6cff6f9f135c687aebc6eb676f722ffab83d7e6993fb824f7802b977cd05","dns_names":[],"uris":[],"email_addresses":[],"ip_addresses":[],"not_before":"2026-08-18T03:42:33Z","not_after":"2036-08-15T04:42:33Z","expires_in_seconds":315359983,"chain":["CN=goweb-client","CN=goweb-client-ca"]}}
+{"authenticated":true,"client":{"subject":"CN=goweb-client","issuer":"CN=goweb-client-ca","serial":"83851253258372398577627422287466861029","fingerprint_sha256":"e7467fda77ae120de4e71a9659106479a1ae8fbc2cd97f4bf8d7656305166a0f","dns_names":[],"uris":[],"email_addresses":[],"ip_addresses":[],"not_before":"2026-08-18T04:02:28Z","not_after":"2036-08-15T05:02:28Z","expires_in_seconds":315359986,"chain":["CN=goweb-client","CN=goweb-client-ca"]}}
 ```
 
 Without a client certificate, `/whoami.json` returns `403` and:
