@@ -123,9 +123,14 @@ Notes for consumers:
 Client-certificate verification is off unless `GOWEB_MTLS_CLIENT_CA` is set.
 It is a listener-wide setting — every TLS handshake on the port may present a
 client certificate — but only `/whoami` and `/whoami.json` require one.
-`/livez`, `/readyz`, `/status` and `/status.json` are unaffected whether or
-not a client certificate is configured or presented, so Kubernetes probes
-keep working unchanged.
+`/livez`, `/readyz`, `/status` and `/status.json` never require a client
+certificate and work whether or not one is configured. They also work when
+one is configured but the caller presents none. What they cannot survive is
+a *presented* certificate that fails verification: under
+`VerifyClientCertIfGiven`, that aborts the TLS handshake before any route
+runs, so every endpoint on the listener fails alike — see the three-outcome
+table below. Kubernetes probes keep working unchanged only because probes
+never present a client certificate.
 
 `/` is not unaffected: it always prints the SNI name from the handshake, and
 when the caller presented a certificate the server verified, it additionally
@@ -147,23 +152,30 @@ handshake before any HTTP request is ever read, so nothing about the
 response can be inspected — an external suite has to assert on a connection
 error there, not on a status code.
 
-The trust store named by `GOWEB_MTLS_CLIENT_CA` is read once, at startup. A
-file that cannot be read, or that contains no PEM certificate, fails startup
-outright rather than silently leaving client-certificate verification
-disabled. Replacing the trust store — adding or removing a trusted CA —
+The trust store named by `GOWEB_MTLS_CLIENT_CA` is read once, at startup, and
+validated: every certificate in the file must be a genuine CA — a valid
+`BasicConstraints` extension with `IsCA` set, `KeyUsage` including
+`CertSign`, and inside its validity window. A file that cannot be read,
+contains no PEM certificate, or contains a block that is not a valid CA
+fails startup outright, naming the offending certificate, rather than
+silently leaving client-certificate verification disabled or half-trusting
+a bundle. Replacing the trust store — adding or removing a trusted CA —
 requires restarting the process; unlike the served certificate, it is not
 watched for changes.
 
 Generate a client CA and a client certificate signed by it, then call the
 endpoint the way an external suite would:
 
-> **Never point `GOWEB_MTLS_CLIENT_CA` at `certs/demo.pem`.** `certs/demo-key.pem`
-> is committed, and the demo leaf carries `ExtKeyUsage: ClientAuth` alongside
-> `ServerAuth`, so trusting it as a client CA would make anyone with this
-> public repository a trusted client. `GOWEB_MTLS_CLIENT_CA` names the client
-> CA generated below (`client-ca.pem`); `--cacert ./certs/demo.pem` in the
-> command below is unrelated — that's curl verifying the server's identity,
-> not the server trusting a client.
+> **Never point `GOWEB_MTLS_CLIENT_CA` at `certs/demo.pem`.** `certs/demo.pem`
+> is a server leaf, not a CA, and `certs/demo-key.pem` is committed alongside
+> it, so pointing client-certificate verification at it would have made
+> anyone with this public repository a trusted client. That misuse is no
+> longer just discouraged: trust-store validation rejects any file that
+> isn't built from genuine CAs, so this now fails startup outright instead
+> of silently trusting whoever holds the demo key. `GOWEB_MTLS_CLIENT_CA`
+> names the client CA generated below (`client-ca.pem`); `--cacert
+> ./certs/demo.pem` in the command below is unrelated — that's curl
+> verifying the server's identity, not the server trusting a client.
 
 ```bash
 make certs-client
@@ -197,6 +209,13 @@ diffed by e2e suites in other repositories, where layout is noise. Every
 response body is followed by exactly one trailing newline. `authenticated`
 is always present, so a consumer can branch on one field rather than on the
 absence of another.
+
+`/whoami` and `/whoami.json` send `Cache-Control: no-store` on every
+response, including refusals — the body carries one client's identity keyed
+only by the URL, and a cache must never store it and replay it to a
+different client. `/whoami` and `/status` additionally send `Vary: Accept`,
+since both negotiate their representation from that header; the dedicated
+`.json` endpoints have exactly one representation and don't send it.
 
 # Certificate reloading
 

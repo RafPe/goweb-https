@@ -428,3 +428,86 @@ README gains:
   and `/readyz` behave byte-identically to `main`. `/` differs only by
   the added SNI line described under "Related change to `handleRoot`".
 - The README contract table matches what the code actually does.
+
+## Amendment: 2026-08-18 review round
+
+The decisions above stand as written; this records what changed after
+review found two real gaps in them, plus two smaller fixes bundled into
+the same round.
+
+**`LoadPool` is replaced by `LoadTrustStore`.** The plan above (`## New
+package: internal/clientauth`) specified `LoadPool(path string)
+(*x509.CertPool, error)` failing only when the file cannot be read or
+contains no certificate. Review found that this let any parseable
+certificate become a trust anchor — Go's `x509.CertPool` does not check
+`BasicConstraints`, `IsCA`, or `KeyUsage` for certificates added directly
+to a pool. `certs/demo.pem` (see below) is exactly this shape: a leaf,
+`BasicConstraintsValid` true, `IsCA` false. Pointing
+`GOWEB_MTLS_CLIENT_CA` at it and its committed key would have let anyone
+holding this public repository authenticate as a verified client.
+Separately, `AppendCertsFromPEM`-style parsing treats a bundle as loaded
+successfully if any block parses, so a corrupt CA sitting beside valid
+ones was silently dropped rather than surfaced — the wrong default for a
+trust store.
+
+`internal/clientauth.LoadTrustStore(path string) (*TrustStore, error)`
+now fails closed: every `CERTIFICATE` block must have
+`BasicConstraintsValid`, `IsCA`, and `KeyUsageCertSign`, and must be
+within its validity window; a block that claims to be a certificate but
+fails to parse fails the whole load rather than being skipped.
+`TrustStore.Pool()` returns the `*x509.CertPool` for
+`tls.Config.ClientCAs`; `TrustStore.Anchors() []Anchor` returns each
+anchor's subject, issuer, serial, SHA-256 fingerprint, and validity
+window, for startup logging. The fingerprint is included because CA
+rotation commonly preserves the subject DN, so a subject alone cannot
+tell an operator which CA is actually trusted — `main.go`'s startup log
+field is renamed from `client_ca_subjects` to `client_ca_trust_anchors`
+accordingly.
+
+**The demo server leaf's profile is trimmed.** The "Never point
+`GOWEB_MTLS_CLIENT_CA` at `certs/demo.pem`" hazard was already known and
+documented (see the README section this plan specified), but the demo
+server leaf itself carried `ExtKeyUsage: ServerAuth, ClientAuth` and
+`KeyUsage: DigitalSignature | KeyEncipherment` — a server fixture with
+client-auth capability it never needed, and RSA key transport that this
+server's TLS 1.3-only configuration never uses. `hack/gencerts` now
+emits the server leaf with `ExtKeyUsage: ServerAuth` only and `KeyUsage:
+DigitalSignature` only; `certs/demo.pem`, `certs/demo-key.pem` and
+`certs/bundle.pem` were regenerated with the trimmed profile (common
+name and SANs unchanged). With `LoadTrustStore` in place, pointing
+`GOWEB_MTLS_CLIENT_CA` at `certs/demo.pem` now fails startup outright
+rather than silently trusting the committed key — the trimmed leaf
+profile is defense in depth on top of that, not the primary control.
+
+`hack/gencerts` also now writes key material through a temp file created
+with the intended mode, then renames it into place: `os.WriteFile`'s mode
+argument only applies when a file is newly created, so regenerating a key
+over one that already existed at `0o644` previously left it
+world-readable.
+
+**The probes-are-unaffected claim needed a correction.** The plan's
+"Scope" section says probe behaviour is unchanged "beyond one labelling
+fix." Review found the README's phrasing of that claim — that
+`/livez`, `/readyz`, `/status` and `/status.json` are unaffected "whether
+or not a client certificate is configured or presented" — was wrong
+about the word "presented." Under `VerifyClientCertIfGiven`, a client
+certificate that fails verification aborts the TLS handshake before any
+route runs, so those endpoints fail too when one is presented and
+invalid. This was already correctly captured in the three-outcome table
+this plan specified (`## Documentation`); the prose above it
+contradicted its own table. The README prose is corrected to match the
+table: those endpoints never *require* a client certificate and work
+when none is presented, but a *presented* certificate must still verify,
+for every endpoint on the listener.
+
+**New response headers on `/whoami` and `/status`, not specified above.**
+`/whoami` and `/whoami.json` now send `Cache-Control: no-store` on every
+response, including refusals, since the body carries one client's
+identity keyed only by the URL and must never be cached and replayed to
+a different client. `/whoami` and `/status` send `Vary: Accept`, since
+both negotiate representation from that header; the dedicated `.json`
+endpoints have exactly one representation and don't send it. Also,
+`writeJSONEncodeError`'s fallback body now goes through `writeJSONBody`
+instead of `http.Error`, so a JSON consumer that hits an encoding
+failure still gets `Content-Type: application/json` rather than
+`text/plain`.
