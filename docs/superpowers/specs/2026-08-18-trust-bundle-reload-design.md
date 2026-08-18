@@ -57,6 +57,49 @@ Invariant 1 gets a dedicated test asserting the published pool is never nil
 after a failed reload. Invariant 2 gets a test asserting a client trusted
 before a shrinking rotation is rejected after it.
 
+### Why last-known-good, and not fail-closed
+
+Publishing nil is a bug, not a policy. Given that, the real choice on a
+failed reload was between retaining the last good pool, publishing an empty
+pool so every client is rejected, and treating the failure as fatal.
+
+Retaining the last good pool is chosen. The failure mode it accepts is
+continuing to trust a CA someone was trying to remove, until an operator
+notices the warning. The failure mode the alternatives accept is that a
+single bad edit to a ConfigMap takes the fixture down for every consumer,
+including e2e suites mid-run. For a component whose purpose is to be
+available to other teams' test suites, availability under operator error is
+worth more than immediate strictness — and the staleness is not silent: it
+is logged on every failed reconcile and reported in `/status.json`.
+
+Treating it as fatal was rejected for the same reason, with the extra cost
+that startup also fails, so the pod enters CrashLoopBackOff until the file
+is fixed.
+
+This mirrors how the served certificate already behaves: the reloader
+continues to serve the last valid certificate rather than dropping traffic
+(`internal/certreload/watch.go`).
+
+### Why a shrinking bundle applies immediately
+
+The alternative considered was requiring two consecutive reconciles to agree
+before applying a bundle with fewer CAs, guarding against a writer caught
+mid-write whose partial output happens to parse.
+
+Rejected. It delays every genuine revocation by up to one
+`GOWEB_RELOAD_INTERVAL`, and revocation is the emergency this feature exists
+to serve. The risk it guards against does not arise under the deployment
+this is built for: Kubernetes writes a new timestamped directory and
+atomically swaps the `..data` symlink, so a reader never observes a
+partially written bundle.
+
+That makes atomic replacement an **operational requirement**, not an
+assumption to leave implicit. A writer that rewrites the file in place can
+be read mid-write, and a partial bundle that still parses is
+indistinguishable from a deliberate revocation — no reader-side logic can
+tell them apart. The README must say so: replace the bundle atomically, as
+projected volumes, ConfigMaps, Secrets and ClusterTrustBundles all do.
+
 ## Decisions
 
 ### Reuse the existing watch loop; do not write a second one
@@ -340,5 +383,6 @@ alongside `srv.Run` and `reloader.Watch`.
   style atomic swap.
 - With `GOWEB_MTLS_CLIENT_CA` unset, behaviour is byte-identical to
   `mtls-client-auth`.
-- README documents the reload behaviour, the readiness asymmetry and the new
-  `/status.json` block.
+- README documents the reload behaviour, the readiness asymmetry, the new
+  `/status.json` block, and the requirement that the bundle be replaced
+  atomically rather than rewritten in place.
