@@ -12,6 +12,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"slices"
@@ -19,24 +20,56 @@ import (
 )
 
 // LoadPool reads a PEM file of client CA certificates and returns a pool that
-// client certificates are verified against.
+// client certificates are verified against, together with the subject of
+// every CA it contains.
+//
+// The subjects are collected here, rather than derived from the pool
+// afterwards, so a startup log naming them costs nothing extra: LoadPool
+// accepts any PEM containing at least one certificate, so pointing it at the
+// wrong file - an old CA, a server certificate, a bundle missing one CA -
+// starts cleanly and only fails, silently, the first time a legitimate
+// client is rejected. Logging the trusted subjects at startup is what lets
+// an operator catch that before it does.
 //
 // A file that yields no certificate is an error rather than an empty pool.
 // An empty pool would fail every client certificate presented to it, which is
 // an operator mistake and not a configuration anyone intends.
-func LoadPool(path string) (*x509.CertPool, error) {
+func LoadPool(path string) (*x509.CertPool, []string, error) {
 	// #nosec G304 -- the path is operator-supplied configuration; reading it is the point
 	encoded, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("clientauth: read client CA file: %w", err)
+		return nil, nil, fmt.Errorf("clientauth: read client CA file: %w", err)
 	}
 
 	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(encoded) {
-		return nil, fmt.Errorf("clientauth: %s contains no PEM certificate", path)
+	var subjects []string
+
+	rest := encoded
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			// Matches x509.CertPool.AppendCertsFromPEM: a block that claims to
+			// be a certificate but does not parse as one is skipped rather
+			// than failing the whole file.
+			continue
+		}
+		pool.AddCert(cert)
+		subjects = append(subjects, cert.Subject.String())
 	}
 
-	return pool, nil
+	if len(subjects) == 0 {
+		return nil, nil, fmt.Errorf("clientauth: %s contains no PEM certificate", path)
+	}
+
+	return pool, subjects, nil
 }
 
 // Identity describes a client certificate that the server verified.

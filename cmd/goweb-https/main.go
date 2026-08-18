@@ -42,9 +42,12 @@ func run(ctx context.Context) error {
 	// The trust store is loaded once. It changes on a different timescale
 	// from the served certificate, and a restart is an acceptable way to
 	// pick up a new one.
-	var clientCAs *x509.CertPool
+	var (
+		clientCAs        *x509.CertPool
+		clientCASubjects []string
+	)
 	if cfg.ClientCAFile != "" {
-		clientCAs, err = clientauth.LoadPool(cfg.ClientCAFile)
+		clientCAs, clientCASubjects, err = clientauth.LoadPool(cfg.ClientCAFile)
 		if err != nil {
 			return err
 		}
@@ -101,6 +104,7 @@ func run(ctx context.Context) error {
 		"shutdown_timeout", cfg.ShutdownTimeout,
 		"client_certificate_verification", cfg.ClientCAFile != "",
 		"client_ca_file", cfg.ClientCAFile,
+		"client_ca_subjects", clientCASubjects,
 	)
 
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)

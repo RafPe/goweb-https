@@ -20,9 +20,9 @@ import (
 	"time"
 )
 
-// writeCAFile writes a self-signed CA certificate to a temporary PEM file and
-// returns its path.
-func writeCAFile(t *testing.T) string {
+// caCertPEM generates a self-signed CA certificate with the given common name
+// and returns it PEM encoded.
+func caCertPEM(t *testing.T, commonName string) []byte {
 	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -32,7 +32,7 @@ func writeCAFile(t *testing.T) string {
 
 	template := x509.Certificate{
 		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "test-ca"},
+		Subject:               pkix.Name{CommonName: commonName},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
@@ -45,9 +45,16 @@ func writeCAFile(t *testing.T) string {
 		t.Fatalf("create certificate: %v", err)
 	}
 
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// writeCAFile writes a single self-signed CA certificate, CN "test-ca", to a
+// temporary PEM file and returns its path.
+func writeCAFile(t *testing.T) string {
+	t.Helper()
+
 	path := filepath.Join(t.TempDir(), "ca.pem")
-	encoded := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+	if err := os.WriteFile(path, caCertPEM(t, "test-ca"), 0o600); err != nil {
 		t.Fatalf("write ca file: %v", err)
 	}
 	return path
@@ -78,7 +85,7 @@ func TestLoadPool(t *testing.T) {
 
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			pool, err := LoadPool(test.path)
+			pool, subjects, err := LoadPool(test.path)
 
 			if test.wantError {
 				if err == nil {
@@ -86,6 +93,9 @@ func TestLoadPool(t *testing.T) {
 				}
 				if pool != nil {
 					t.Errorf("LoadPool returned a pool alongside an error; want nil")
+				}
+				if subjects != nil {
+					t.Errorf("LoadPool returned subjects alongside an error; want nil")
 				}
 				return
 			}
@@ -96,7 +106,41 @@ func TestLoadPool(t *testing.T) {
 			if pool == nil {
 				t.Fatal("LoadPool returned a nil pool without an error")
 			}
+			if want := []string{"CN=test-ca"}; !slices.Equal(subjects, want) {
+				t.Errorf("subjects = %v, want %v", subjects, want)
+			}
 		})
+	}
+}
+
+// TestLoadPool_Subjects proves the returned subjects are collected from the
+// CAs actually in the file, in order, rather than being some placeholder
+// that happens to satisfy TestLoadPool's single-CA case. This is what a
+// startup log naming "the subjects it will trust" depends on: a subject list
+// that doesn't reliably reflect the file's contents would be worse than no
+// list, since it would read as confirmation of the wrong thing.
+func TestLoadPool_Subjects(t *testing.T) {
+	var encoded []byte
+	for _, name := range []string{"first-ca", "second-ca"} {
+		encoded = append(encoded, caCertPEM(t, name)...)
+	}
+
+	path := filepath.Join(t.TempDir(), "cas.pem")
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatalf("write ca file: %v", err)
+	}
+
+	pool, subjects, err := LoadPool(path)
+	if err != nil {
+		t.Fatalf("LoadPool(%q) returned %v, want no error", path, err)
+	}
+	if pool == nil {
+		t.Fatal("LoadPool returned a nil pool without an error")
+	}
+
+	want := []string{"CN=first-ca", "CN=second-ca"}
+	if !slices.Equal(subjects, want) {
+		t.Errorf("subjects = %v, want %v", subjects, want)
 	}
 }
 
